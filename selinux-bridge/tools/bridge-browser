@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#
+# bridge-browser -- launch Chromium wired to the bridged microphone, and
+# optionally to a clip recorded from the bridged camera.
+#
+# Read this before expecting a webcam in a browser tab:
+#
+#   The microphone works. It is a real PulseAudio source, so Chromium finds
+#   it the ordinary way and getUserMedia({audio:true}) returns live audio
+#   from the phone. Nothing special is needed beyond starting bridge-mic.
+#
+#   Live video does not work, and cannot be made to. Chromium's only route
+#   for an injected camera is --use-file-for-fake-video-capture, and its
+#   FileVideoCaptureDevice reads the file's contents when the device is
+#   opened and never looks at the file again. Measured here two ways:
+#   appending live frames while it read produced a constant image, and
+#   rewriting every frame in place after it had started produced a constant
+#   image as well. Pointing the flag at a FIFO fails earlier still, with
+#   NotFoundError at open. So the flag can serve a fixed recording and
+#   nothing else. (PipeWire plus the camera portal is the one untried
+#   route; installing it needs root, which this container does not have.)
+#
+# What that leaves is --clip, which records a few seconds from the phone
+# camera and hands Chromium that. It is real footage from the real camera,
+# but it is a loop, not a live feed -- so it is offered plainly as such.
+#
+# Native applications are unaffected by any of this: they read the FIFO from
+# bridge-webcam directly and get a genuinely live, low-latency camera.
+#
+# The LD_PRELOAD is unrelated to capture and required regardless -- Chromium's
+# GPU process aborts here because /proc/bus/pci/devices is unreadable, and the
+# shim answers that read.
+#
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${BRIDGE_STATE_DIR:-$HOME/.cache/selinux-bridge}"
+FIFO="$STATE_DIR/webcam.y4m"
+CLIP="$STATE_DIR/webcam-clip.y4m"
+SHIM="${PCI_SHIM_LIB:-$HOME/.local/lib/pci-shim/libpcishim.so}"
+SHIM_DATA="${PCI_SHIM_DATA:-$HOME/.local/lib/pci-shim/pci-devices}"
+FFMPEG="${FFMPEG:-ffmpeg}"
+
+CLIP_SECS=0
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --clip) CLIP_SECS="${2:-5}"; shift 2 ;;
+        --clip=*) CLIP_SECS="${1#*=}"; shift ;;
+        -h|--help)
+            sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^#\{0,1\} \{0,1\}//'
+            echo "usage: bridge-browser [--clip SECONDS] [chromium args...]"
+            exit 0 ;;
+        *) break ;;
+    esac
+done
+
+CHROME="${CHROMIUM:-$(command -v chromium || command -v chromium-browser || true)}"
+if [ -z "$CHROME" ]; then
+    echo "no chromium found; set CHROMIUM=/path/to/chromium" >&2
+    exit 1
+fi
+
+if [ "$CLIP_SECS" -gt 0 ] 2>/dev/null; then
+    if [ ! -p "$FIFO" ]; then
+        echo "camera: not running -- start it with 'bridge-webcam start'" >&2
+        exit 1
+    fi
+    echo "camera: recording ${CLIP_SECS}s from the phone camera..."
+    if ! timeout $((CLIP_SECS + 25)) "$FFMPEG" -v error -y \
+            -f yuv4mpegpipe -i "$FIFO" -t "$CLIP_SECS" \
+            -f yuv4mpegpipe -pix_fmt yuv420p "$CLIP"; then
+        echo "camera: recording failed; launching without video" >&2
+        CLIP_SECS=0
+    fi
+fi
+
+if [ "$CLIP_SECS" -gt 0 ] 2>/dev/null && [ -s "$CLIP" ]; then
+    ARGS+=(--use-fake-device-for-media-stream
+           --use-file-for-fake-video-capture="$CLIP"
+           --use-fake-ui-for-media-stream)
+    echo "camera: $CLIP (a recorded loop, not a live feed -- see the notes at the top of this script)"
+else
+    echo "camera: no video -- Chromium cannot take a live camera from this bridge."
+    echo "        Use '--clip SECONDS' for a recorded loop, or read the FIFO"
+    echo "        directly from a native app for a genuinely live camera."
+fi
+
+if pactl list short sources 2>/dev/null | grep -q bridge_mic; then
+    echo "mic:    bridge_mic (live)"
+else
+    echo "mic:    not running (start it with bridge-mic)"
+fi
+
+if [ -f "$SHIM" ]; then
+    export LD_PRELOAD="$SHIM${LD_PRELOAD:+:$LD_PRELOAD}"
+    export PCI_DEVICES_SHIM="$SHIM_DATA"
+fi
+
+exec "$CHROME" "${ARGS[@]}" "$@"

@@ -164,6 +164,20 @@ static int rc_mode_for(const char *name) {
     return -1;
 }
 
+/*
+ * Audio source names, matching MediaRecorder.AudioSource on the far side.
+ * "voice" is spelled out rather than abbreviated in the help because the
+ * distinction -- platform echo cancellation on or off -- is the one thing
+ * about it a caller has to get right.
+ */
+static int audio_source_for(const char *name) {
+    if (!strcmp(name, "mic"))          return 0;
+    if (!strcmp(name, "voice"))        return 1;
+    if (!strcmp(name, "camcorder"))    return 2;
+    if (!strcmp(name, "unprocessed"))  return 3;
+    return -1;
+}
+
 /* ------------------------------------------------------------ NAL parsing */
 
 /*
@@ -348,6 +362,12 @@ struct session {
     int width, height, fps, bitrate;
     int codec;
     int rc_mode;
+    /* Capture only: wrap video frames as Y4M so a consumer can open the
+     * stream without being told its geometry separately. */
+    int y4m;
+    /* Capture only: emit Y4M frame markers but no file header, for
+     * appending live frames to a file that already has one. */
+    int append;
     const char *infile, *outfile;
 };
 
@@ -376,11 +396,125 @@ static int run_text_session(int sock) {
     return RC_OK;
 }
 
+/*
+ * Capture modes are push-only: the bridge sends a format record and then
+ * frames (or PCM chunks) until it is told to stop by the socket closing.
+ * There is no writer thread and no input file, which makes this a much
+ * simpler loop than encode/decode -- and it must stay that way, because the
+ * whole point is to hand bytes to a downstream consumer with no added
+ * latency.
+ *
+ * Y4M framing is applied for video when asked, because that is what turns
+ * the raw stream into something ffmpeg, VLC and Chromium can all open
+ * without being told the geometry out of band.
+ */
+static int run_capture_session(int sock, const struct session *s, FILE *fout) {
+
+    int is_video = (s->mode == 4);
+    int announced = 0;
+    long units = 0, bytes = 0;
+    int rc = RC_OK;
+
+    for (;;) {
+        int32_t len;
+        if (read_i32(sock, &len) != 0) {
+            rc = io_timed_out ? RC_TIMEOUT : RC_ERR;
+            break;
+        }
+        if (len == -1) break;
+        if (len == -2) {
+            int32_t a, b;
+            if (read_i32(sock, &a) != 0 || read_i32(sock, &b) != 0) {
+                rc = io_timed_out ? RC_TIMEOUT : RC_ERR;
+                break;
+            }
+            if (is_video) {
+                fprintf(stderr, "capturing %dx%d\n", a, b);
+                /*
+                 * The header goes out once, and never in append mode: the
+                 * target file already has one, and a second header partway
+                 * through is read as a corrupt frame.
+                 */
+                if (s->y4m && !s->append && !announced) {
+                    /*
+                     * Chromium paces its fake-capture device from the frame
+                     * rate declared here, so getting it wrong makes a webcam
+                     * run fast or slow with no other symptom.
+                     */
+                    fprintf(fout, "YUV4MPEG2 W%d H%d F%d:1 Ip A1:1 C420mpeg2\n",
+                            a, b, s->fps > 0 ? s->fps : 30);
+                    fflush(fout);
+                }
+            } else {
+                fprintf(stderr, "capturing %dHz x%d s16le\n", a, b);
+            }
+            announced = 1;
+            continue;
+        }
+        if (len < 0) {
+            fprintf(stderr, "protocol error: unexpected length %d\n", len);
+            rc = RC_ERR;
+            break;
+        }
+        if (!announced) {
+            fprintf(stderr, "protocol error: data before the format record\n");
+            rc = RC_ERR;
+            break;
+        }
+        uint8_t *buf = malloc((size_t)len);
+        if (!buf) { rc = RC_ERR; break; }
+        if (read_all(sock, buf, (size_t)len) != 0) {
+            free(buf);
+            rc = io_timed_out ? RC_TIMEOUT : RC_ERR;
+            break;
+        }
+        if (is_video && s->y4m) fputs("FRAME\n", fout);
+        if (fwrite(buf, 1, (size_t)len, fout) != (size_t)len) {
+            /* Downstream went away: that is a normal end, not a failure. */
+            free(buf);
+            fprintf(stderr, "output closed after %ld unit(s)\n", units);
+            break;
+        }
+        fflush(fout);
+        free(buf);
+        units++;
+        bytes += len;
+    }
+
+    if (fout != stdout) fclose(fout);
+    else fflush(stdout);
+    fprintf(stderr, "%s: %ld unit(s), %ld byte(s)\n",
+            is_video ? "camera" : "microphone", units, bytes);
+    return rc;
+}
+
 static int run_session(const struct session *s) {
     io_timed_out = 0;
 
+    /*
+     * Capture opens its output before connecting, and the order is
+     * load-bearing. With a FIFO, opening for write blocks until a reader
+     * attaches; doing it first means the phone's camera is not opened --
+     * and its indicator not lit -- until something actually wants frames.
+     * Connecting first would hold the camera open against an empty pipe.
+     */
+    FILE *capture_out = NULL;
+    if (s->mode == 4 || s->mode == 5) {
+        if (!strcmp(s->outfile, "-")) {
+            capture_out = stdout;
+        } else {
+            /* Append must really append: the target may already hold a
+             * header and frames that something is reading right now. */
+            capture_out = fopen(s->outfile, s->append ? "ab" : "wb");
+            if (!capture_out) { perror(s->outfile); return RC_ERR; }
+        }
+    }
+
     int sock = connect_bridge();
-    if (sock < 0) return RC_ERR;
+    if (sock < 0) {
+        if (capture_out && capture_out != stdout) fclose(capture_out);
+        return RC_ERR;
+    }
 
     if (write_i32(sock, s->mode) != 0 ||
         write_i32(sock, s->width) != 0 ||
@@ -389,6 +523,7 @@ static int run_session(const struct session *s) {
         write_i32(sock, s->bitrate) != 0 ||
         write_i32(sock, s->codec | (s->rc_mode << 8)) != 0) {
         fprintf(stderr, "failed to send handshake\n");
+        if (capture_out && capture_out != stdout) fclose(capture_out);
         close(sock);
         return io_timed_out ? RC_TIMEOUT : RC_ERR;
     }
@@ -405,11 +540,17 @@ static int run_session(const struct session *s) {
     if (status != 0) {
         fprintf(stderr, "server rejected request: %s\n", reply ? reply : "(no message)");
         free(reply);
+        /* Close the capture output too, so a reader blocked on the other
+         * end of the FIFO sees EOF instead of waiting for frames that a
+         * refused session is never going to produce. */
+        if (capture_out && capture_out != stdout) fclose(capture_out);
         close(sock);
         return RC_ERR;
     }
     if (s->mode == 2 || s->mode == 3) {
         fprintf(stderr, "connected (bridge is alive)\n");
+    } else if (s->mode == 4 || s->mode == 5) {
+        fprintf(stderr, "handshake ok, capture source: %s\n", reply ? reply : "?");
     } else {
         fprintf(stderr, "handshake ok, codec selected on-device: %s\n", reply ? reply : "?");
     }
@@ -417,6 +558,13 @@ static int run_session(const struct session *s) {
 
     if (s->mode == 2 || s->mode == 3) {
         int rc = run_text_session(sock);
+        if (rc == RC_TIMEOUT) timeout_hint();
+        close(sock);
+        return rc;
+    }
+
+    if (s->mode == 4 || s->mode == 5) {
+        int rc = run_capture_session(sock, s, capture_out);
         if (rc == RC_TIMEOUT) timeout_hint();
         close(sock);
         return rc;
@@ -542,6 +690,8 @@ static void usage(const char *prog) {
         "  %s decode [-c CODEC] [<w> <h>] <in.bs> <out.yuv420>\n"
         "  %s info\n"
         "  %s log\n"
+        "  %s camera [-i INDEX] [--raw|--append] <w> <h> <fps> <frames> <out.y4m>\n"
+        "  %s mic [-s SOURCE] <rate> <channels> <seconds> <out.pcm>\n"
         "\n"
         "  CODEC  h264 (default) | hevc | vp9 | av1\n"
         "  RC     cbr (default) | vbr | cq   (encode only)\n"
@@ -551,12 +701,24 @@ static void usage(const char *prog) {
         "         as a quality in 1..100 instead. Not every component\n"
         "         offers every mode; \"info\" lists what each supports,\n"
         "         and an unsupported one is refused, not substituted.\n"
+        "  INDEX  camera: 0 = rear (default), 1 = selfie; \"info\" lists them\n"
+        "  SOURCE mic: mic (default) | voice | camcorder | unprocessed\n"
+        "         voice adds the platform echo canceller and noise\n"
+        "         suppressor, which is what you want when the far end is\n"
+        "         playing out of this phone's own speaker\n"
+        "  --raw  camera: emit bare I420 instead of Y4M\n"
+        "  --append  camera: Y4M frames with no file header, to append to\n"
+        "         a file that already has one while something reads it\n"
+        "  camera <w> <h> are a hint; the bridge picks the nearest size the\n"
+        "  camera really offers and announces it. <frames> and <seconds> of\n"
+        "  0 mean \"until this client is stopped\".\n"
         "  \"-\"    as a filename means stdin/stdout\n"
         "  decode dimensions are optional: the bridge announces the real\n"
         "  picture size, and reports it again if it changes mid-stream\n"
         "\n"
         "env: BRIDGE_TIMEOUT=%d  BRIDGE_RETRIES=%d  BRIDGE_PORT=%d\n",
-        prog, prog, prog, prog, timeout_secs(), retry_count(), bridge_port());
+        prog, prog, prog, prog, prog, prog,
+        timeout_secs(), retry_count(), bridge_port());
 }
 
 int main(int argc, char **argv) {
@@ -570,13 +732,32 @@ int main(int argc, char **argv) {
     struct session s;
     memset(&s, 0, sizeof(s));
     s.codec = 0;
+    /* Y4M by default for capture: a bare I420 stream carries no geometry,
+     * so every consumer would need to be told it separately. --raw opts
+     * out for a caller that already knows. */
+    s.y4m = 1;
 
     const char *sub = argv[1];
     int ai = 2;
 
     /* Flags between the subcommand and its positional args, in any order. */
-    while (ai + 1 < argc && argv[ai][0] == '-' && argv[ai][1] != '\0'
+    while (ai < argc && argv[ai][0] == '-' && argv[ai][1] != '\0'
            && strcmp(argv[ai], "-")) {
+        /* Valueless flags first: the rest consume the following token. */
+        if (!strcmp(argv[ai], "--raw")) {
+            s.y4m = 0;
+            ai += 1;
+            continue;
+        }
+        if (!strcmp(argv[ai], "--append")) {
+            s.append = 1;
+            ai += 1;
+            continue;
+        }
+        if (ai + 1 >= argc) {
+            fprintf(stderr, "flag '%s' needs a value\n", argv[ai]);
+            return RC_USAGE;
+        }
         if (!strcmp(argv[ai], "-c")) {
             s.codec = codec_id_for(argv[ai + 1]);
             if (s.codec < 0) {
@@ -589,6 +770,20 @@ int main(int argc, char **argv) {
             if (s.rc_mode < 0) {
                 fprintf(stderr, "unknown rate control '%s' (want cbr, vbr or cq)\n",
                         argv[ai + 1]);
+                return RC_USAGE;
+            }
+        } else if (!strcmp(argv[ai], "-i")) {
+            /* Camera index rides in the codec field's low byte. */
+            s.codec = atoi(argv[ai + 1]);
+            if (s.codec < 0 || s.codec > 255) {
+                fprintf(stderr, "camera index must be 0..255\n");
+                return RC_USAGE;
+            }
+        } else if (!strcmp(argv[ai], "-s")) {
+            s.codec = audio_source_for(argv[ai + 1]);
+            if (s.codec < 0) {
+                fprintf(stderr, "unknown audio source '%s'"
+                        " (want mic, voice, camcorder or unprocessed)\n", argv[ai + 1]);
                 return RC_USAGE;
             }
         } else {
@@ -626,6 +821,37 @@ int main(int argc, char **argv) {
         s.mode = 2;
     } else if (!strcmp(sub, "log")) {
         s.mode = 3;
+    } else if (!strcmp(sub, "camera")) {
+        if (rest != 5) {
+            fprintf(stderr, "camera needs 5 args\n"); usage(argv[0]); return RC_USAGE;
+        }
+        s.mode = 4;
+        s.width = atoi(argv[ai]); s.height = atoi(argv[ai + 1]);
+        s.fps = atoi(argv[ai + 2]);
+        s.bitrate = atoi(argv[ai + 3]);   /* frame budget, 0 = unlimited */
+        s.infile = "-"; s.outfile = argv[ai + 4];
+        if (s.width <= 0 || s.height <= 0) {
+            fprintf(stderr, "camera width and height must be positive\n");
+            return RC_USAGE;
+        }
+        if (s.bitrate < 0) {
+            fprintf(stderr, "frame budget must be >= 0 (0 means unlimited)\n");
+            return RC_USAGE;
+        }
+    } else if (!strcmp(sub, "mic")) {
+        if (rest != 4) {
+            fprintf(stderr, "mic needs 4 args\n"); usage(argv[0]); return RC_USAGE;
+        }
+        s.mode = 5;
+        s.width = atoi(argv[ai]);         /* sample rate */
+        s.height = atoi(argv[ai + 1]);    /* channels */
+        s.fps = 0;
+        s.bitrate = atoi(argv[ai + 2]);   /* seconds, 0 = unlimited */
+        s.infile = "-"; s.outfile = argv[ai + 3];
+        if (s.width < 0 || s.height < 0 || s.bitrate < 0) {
+            fprintf(stderr, "rate, channels and seconds must be >= 0\n");
+            return RC_USAGE;
+        }
     } else {
         fprintf(stderr, "unknown mode '%s'\n", sub);
         usage(argv[0]);
@@ -652,6 +878,13 @@ int main(int argc, char **argv) {
     int streaming_stdio = (s.mode == 0 || s.mode == 1) &&
                           (!strcmp(s.infile, "-") || !strcmp(s.outfile, "-"));
     if (streaming_stdio) retries = 0;
+    /*
+     * Never retry a capture. Reconnecting rewrites the Y4M header partway
+     * through the output, which for a live consumer reading the same file
+     * is worse than stopping: it sees a header where a frame should be and
+     * either stalls or shows garbage.
+     */
+    if (s.mode == 4 || s.mode == 5) retries = 0;
 
     int rc = RC_ERR;
     for (int attempt = 0; attempt <= retries; attempt++) {

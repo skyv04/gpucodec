@@ -48,7 +48,9 @@ to remind you.
 | `app/src/main/java/com/selinuxbridge/app/BridgeService.java` | The actual bridge: `ServerSocket` on `127.0.0.1:7878`, wire protocol below, drives `android.media.MediaCodec` synchronously, explicitly preferring hardware (`c2.qti.*`) codec components, admits sessions through a semaphore sized from the device's own codec-instance limit, one thread per client so a crashed session doesn't take down the accept loop, and logs to a file it can also stream back over the socket. |
 | `app/src/main/java/com/selinuxbridge/app/BootReceiver.java` | Restarts the service after a reboot (`BOOT_COMPLETED`/`QUICKBOOT_POWERON`) and after an in-place update (`MY_PACKAGE_REPLACED`), so the two recoverable halves of gap #4 need no human. |
 | `app/src/main/java/com/selinuxbridge/app/I420.java` | Conversion between the tightly packed I420 the wire protocol carries and whatever layout MediaCodec actually hands out (padded row strides, padded slice heights, semi-planar chroma). Deliberately framework-free so it can be unit tested on a normal JVM. |
-| `bridge_client.c` | Debian-side client/CLI: connects over loopback, sends raw frames or a bitstream (from a file or a pipe), prints round-trip stats and the codec name actually used. Supports `encode`/`decode`/`info`/`log`, h264/hevc/vp9/av1 via `-c`, bounded socket timeouts with a distinct exit code, a streaming Annex-B splitter with O(1) memory, and v4 format records so `decode` needs no dimensions. |
+| `app/src/main/java/com/selinuxbridge/app/CameraSource.java` | Camera2 capture for `mode=4`, repacked to tightly packed I420 through `I420.java`. Enumerates back camera first, picks the nearest supported size to the request (and announces what it got), and holds a bounded queue that **drops the oldest** frame under pressure — for a live camera, latency matters and a dropped frame does not. |
+| `app/src/main/java/com/selinuxbridge/app/MicSource.java` | `AudioRecord` capture for `mode=5`, emitting little-endian S16 in ~100 ms units, with a buffer 4× the reported minimum so a scheduling hiccup doesn't overrun it. |
+| `bridge_client.c` | Debian-side client/CLI: connects over loopback, sends raw frames or a bitstream (from a file or a pipe), prints round-trip stats and the codec name actually used. Supports `encode`/`decode`/`info`/`log`/`camera`/`mic`, h264/hevc/vp9/av1 via `-c`, bounded socket timeouts with a distinct exit code, a streaming Annex-B splitter with O(1) memory, and v4 format records so `decode` needs no dimensions. |
 | `build.sh` | Rebuilds the signed APK from source using raw SDK command-line tools (`aapt2`, `javac`, `d8`, `apksigner`) — no gradle/network dependency. Signs with a persistent key in `keystore/` so rebuilds install as in-place updates. |
 | `keystore/` | Local debug signing key, gitignored. Kept outside `build/` so `build.sh`'s clean step cannot destroy it (see gap #9). |
 | `../ffmpeg/selinuxbridge.c` | libavcodec wrapper registering `h264_selinuxbridge` / `hevc_selinuxbridge` as real ffmpeg **encoders and decoders**. |
@@ -56,7 +58,10 @@ to remind you.
 | `tools/bridge-status` | Health-check script: reports whether the app is reachable and prints its `info` diagnostics (device, Android version, all four video codecs and which are hardware-backed, concurrency limit). `--log` also dumps the app's log. |
 | `tools/hw-transcode` | Wrapper that pipes an arbitrary ffmpeg-readable input through the bridge's hardware encoder and remuxes to a normal container — the hardware-codec analogue of this repo's `agc-from`/`agc-to`. `-c hevc` selects HEVC; `-D` also decodes on the hardware block, making the transcode hardware end to end. |
 | `tools/selftest` | Full regression suite. Needs no phone and no installed APK: it runs everything against the mock bridge, including fault injection that cannot be arranged reliably on real hardware. |
-| `tools/mock-bridge.py` | A protocol-v4 bridge that reproduces the awkward parts of MediaCodec — codec-config packets, one packet per access unit, lookahead that swallows frames before emitting anything, decode format records — backed by a real x264/x265 subprocess so the output is a genuine stream. `MOCK_RESIZE_AT=N` forces a mid-stream resolution change, which is impractical to provoke on real hardware. |
+| `tools/bridge-webcam` | Publishes the phone camera as a **FIFO** carrying Y4M, which native applications (`ffplay`, `ffmpeg`, VLC, OBS…) read like any other source. A FIFO makes the camera on-demand for free: opening one for write blocks until a reader attaches, so the camera is not opened — and its indicator not lit — until something actually wants frames, and it is released the moment the reader goes away. |
+| `tools/bridge-mic` | Publishes the phone microphone as a **real PulseAudio source** (`bridge_mic`) via `module-pipe-source`, and makes it the default. No kernel module and no root: PulseAudio is a userspace daemon, so a virtual microphone is something an unprivileged user can simply create. Every audio application, browsers included, then finds it the ordinary way. |
+| `tools/bridge-browser` | Launches Chromium wired to the bridged microphone, and optionally (`--clip SECONDS`) to a short recording from the bridged camera. It does **not** offer a live browser camera, because Chromium cannot accept one — see gap #17. |
+| `tools/mock-bridge.py` | A protocol-v6 bridge that reproduces the awkward parts of MediaCodec — codec-config packets, one packet per access unit, lookahead that swallows frames before emitting anything, decode format records — backed by a real x264/x265 subprocess so the output is a genuine stream. It also fakes capture, including the HAL's habit of rounding a requested camera size to one it actually offers, and can be told to refuse a permission (`MOCK_DENY_CAMERA`, `MOCK_DENY_MIC`). `MOCK_RESIZE_AT=N` forces a mid-stream resolution change, which is impractical to provoke on real hardware. |
 | `tools/test-i420` | JVM unit tests for `I420.java` across planar, semi-planar, padded-stride, padded-slice-height, odd-dimension and cropped layouts. |
 
 ## Building
@@ -155,7 +160,7 @@ network-fetched design tooling.
   open-sourced it in 2000), used the same way this repo's own docs already
   refer to it throughout.
 
-## Wire protocol (v5)
+## Wire protocol (v6)
 
 All integers are 4-byte big-endian (`DataInputStream`/`DataOutputStream`
 network order). One TCP connection = one session.
@@ -165,10 +170,10 @@ network order). One TCP connection = one session.
 
    | field | meaning |
    |---|---|
-   | `mode` | `0` encode, `1` decode, `2` info, `3` log |
-   | `width`/`height` | frame size; decode may send `0 0` and learn the real size from the format record below |
-   | `fps`/`bitrate` | encode only; send 0 otherwise |
-   | `codec` | bits 0–7: `0` h264, `1` hevc, `2` vp9, `3` av1 — **new in v3**.<br>bits 8–15: rate control, encode only — `0` CBR, `1` VBR, `2` CQ — **new in v5**. A v3/v4 client sends a bare `0..3`, so its high bits are zero and it gets CBR, which is the fix for gap #14. In CQ the `bitrate` field carries a quality in 1..100 instead of bits/s. |
+   | `mode` | `0` encode, `1` decode, `2` info, `3` log, `4` camera, `5` microphone — **4 and 5 new in v6** |
+   | `width`/`height` | frame size; decode may send `0 0` and learn the real size from the format record below. For camera it is the *requested* size, which the HAL may round — the format record reports what was actually opened. For microphone it carries `sample_rate` and `channels` instead. |
+   | `fps`/`bitrate` | encode only; send 0 otherwise. Camera uses `fps` for the frame rate and `bitrate` for a frame budget (`0` = until the client disconnects); microphone uses `bitrate` for a duration in milliseconds. |
+   | `codec` | bits 0–7: `0` h264, `1` hevc, `2` vp9, `3` av1 — **new in v3**.<br>bits 8–15: rate control, encode only — `0` CBR, `1` VBR, `2` CQ — **new in v5**. A v3/v4 client sends a bare `0..3`, so its high bits are zero and it gets CBR, which is the fix for gap #14. In CQ the `bitrate` field carries a quality in 1..100 instead of bits/s.<br>For camera it is the camera index; for microphone the audio source. |
 
    Modes 2 and 3 ignore everything after `mode`, but the handshake shape is
    fixed, so dummy values are still sent.
@@ -210,6 +215,32 @@ network order). One TCP connection = one session.
    protocol error rather than guessing — otherwise a future record type
    would be read as a frame length and desynchronise the stream silently.
 
+6. **Capture — new in v6 (modes 4 and 5).** These are one-way: the server
+   sends, the client only reads, and there is no per-unit request. The
+   stream opens with the same `-2 a b` format record used by decode, and it
+   is mandatory rather than advisory, because in both cases the client
+   asked for something the hardware is entitled to refuse:
+
+   - **Camera (mode 4)** — `-2 width height` is the size the HAL actually
+     opened, which is frequently not the size requested; Camera2 offers a
+     fixed menu of stream configurations and picks the nearest. Every unit
+     after the record is one tightly packed I420 frame at that size, via
+     the same `I420.java` path the codec uses, so padded row strides and
+     semi-planar chroma are already dealt with.
+   - **Microphone (mode 5)** — `-2 sample_rate channels`, followed by
+     little-endian signed 16-bit PCM in roughly 100 ms units.
+
+   `-1` ends the stream: the frame budget ran out, the duration elapsed, or
+   the capture stopped. The client hanging up is the normal way to stop an
+   open-ended session, and the server treats it as such rather than as an
+   error.
+
+   Both modes require an Android runtime permission the rest of the bridge
+   does not. If it is missing the session is **refused** at the handshake
+   with a message naming the permission and how to grant it, rather than
+   accepted and left to produce a silent or black stream — the failure mode
+   that made gap #10 invisible for so long.
+
 ### Version history
 
 | version | change |
@@ -219,16 +250,19 @@ network order). One TCP connection = one session.
 | v3 | added the `codec` handshake field (hevc/vp9/av1) and `log` (mode 3) |
 | v4 | added decode format records (`-2 w h`), so decode dimensions are optional and a mid-stream resolution change is a normal event |
 | v5 | added rate control in the codec field's high byte (CBR/VBR/CQ), fixing a 25–34% bitrate overshoot. The header is unchanged, so this is the one version bump that *is* backward compatible |
+| v6 | added capture: `mode=4` camera and `mode=5` microphone, reusing the v4 format record to announce the size the HAL actually opened (camera) or the rate and channel count (microphone). The header is unchanged again, and no existing mode behaves differently, so a v5 client talks to a v6 bridge unmodified |
 
 Versions are **not** wire-compatible with each other. A v3 client talking to
 a v2 server happens to work for `info` (the extra `codec` int is simply never
 read before the server replies), and a v4 client talking to a v3 server works
 for everything except decode (a v3 server simply never sends a format record,
-so the client has no size to report). v5 is the deliberate exception: it
-reuses spare bits of an existing field rather than adding one, so a v5
-client at its default talks to a v4 server unchanged, and asking a v4
-server for a mode it does not have fails loudly (`unknown codec id 256`)
-instead of being silently ignored — both confirmed on real hardware.
+so the client has no size to report). v5 and v6 are the deliberate
+exceptions: v5 reuses spare bits of an existing field rather than adding
+one, and v6 only adds new `mode=` values, so in both cases a newer
+client at its default talks to an older server unchanged, and asking an
+older server for something it does not have fails loudly (`unknown codec
+id 256`, or a rejected mode) instead of being silently ignored — both
+confirmed on real hardware.
 Otherwise encode/decode will mis-frame — update both sides together. `bridge_client info` prints the
 server's protocol version, which is the quickest way to spot a mismatch.
 
@@ -245,7 +279,7 @@ The app's footer carries the same two facts, so the version can be read
 off the screen without a shell:
 
 ```
-protocol v5  ·  build 2026-09-25 11:34:41
+protocol v6  ·  build 2026-09-25 11:34:41
 github.com/skyv04/gpucodec
 ```
 
@@ -254,7 +288,7 @@ timestamp of the code actually answering** in the identical format, so
 the two can be compared directly, and flags the mismatch outright:
 
 ```
-protocol: v5
+protocol: v6
 build: 2026-09-25 11:03:00
 STALE PROCESS: the package was replaced at 11:14:22, after this process started.
   The update did not restart the service, so this is still the old
@@ -343,6 +377,60 @@ tools/bridge-status --log    # diagnostics followed by the log
 Between that and `info`, everything the app knows about itself is reachable
 from Debian with no adb and no root.
 
+## Camera and microphone (v6)
+
+Both need a runtime permission the codec modes do not. Grant them once from
+the app's landing screen — there is a capture card that asks for exactly
+these two and nothing else — then:
+
+```
+tools/bridge-webcam start            # phone camera -> a FIFO carrying Y4M
+tools/bridge-webcam -s 1280x720 -f 30 start
+tools/bridge-webcam status           # idle, or streaming and to whom
+tools/bridge-webcam stop
+
+tools/bridge-mic start               # phone mic -> a PulseAudio source
+tools/bridge-mic status
+tools/bridge-mic stop
+```
+
+The camera is a FIFO on purpose. Opening a FIFO for write blocks until a
+reader attaches, so the camera is not opened — and the phone's camera
+indicator not lit — until something actually asks for frames, and it is
+released again the moment the reader goes away. Any native application can
+consume it:
+
+```
+ffplay -f yuv4mpegpipe -i "$(tools/bridge-webcam path)"
+ffmpeg -f yuv4mpegpipe -i "$(tools/bridge-webcam path)" -t 10 clip.mp4
+```
+
+Or straight from the client, without the supervisor:
+
+```
+./bridge_client camera -i 0 1280 720 30 0 -   # Y4M on stdout, 0 = no limit
+./bridge_client mic 48000 1 0 - > mic.s16     # raw S16LE
+```
+
+The microphone becomes a real PulseAudio source called `bridge_mic`, and
+`bridge-mic` makes it the default — which matters more than it sounds,
+because `getUserMedia({audio:true})` takes the *default* source, and the
+default here is otherwise a silent monitor. A working virtual microphone
+that nothing is routed to is indistinguishable from a broken one.
+
+One constraint worth knowing if you move the FIFO: PulseAudio runs in
+**Termux**, not in this container, so the path must exist identically on
+both sides. `/data/data/com.termux/files/home` does; `/tmp` does not, and
+the only symptom is `module-pipe-source` failing to load with no
+explanation.
+
+### Browsers
+
+Audio works — start `bridge-mic` and any web app gets live phone audio.
+**Live video does not**, and cannot; see gap #17 for the measurements.
+`tools/bridge-browser --clip 5` records five seconds from the camera and
+offers Chromium that instead, which is real footage but a loop.
+
 ## Testing without a device
 
 Most of the bridge can be exercised with no phone attached, no APK installed
@@ -353,7 +441,7 @@ connection and then goes quiet, a bridge that is out of codec slots, a
 semi-planar chroma layout — cannot be arranged reliably on real hardware.
 
 ```sh
-./tools/selftest          # 30 checks, ~3 min
+./tools/selftest          # 43 checks, ~3 min
 ./tools/test-i420         # 10 plane-layout unit tests on a plain JVM
 ```
 
@@ -717,9 +805,11 @@ and every signal available at the time — frame counts, bitrate, file size,
 decodability, luma PSNR — said the bridge was working perfectly.
 
 Status column: **fixed** entries have been implemented and verified (see
-"Verification of the fixes" below). Only gap #4 is still open, and only
-partly: its recoverable halves now heal themselves, but the residue is a
-deliberate Android platform behaviour that no unprivileged app can change.
+"Verification of the fixes" below). Two gaps remain open, and neither is
+open for want of effort: #4's recoverable halves now heal themselves but its
+residue is a deliberate Android platform behaviour that no unprivileged app
+can change, and #17 is a limitation inside Chromium that nothing on this
+side of the socket can reach.
 
 | # | Gap | Severity | Status | Fix that shipped |
 |---|---|---|---|---|
@@ -728,17 +818,18 @@ deliberate Android platform behaviour that no unprivileged app can change.
 | 3 | **Transient first-run stall.** The very first sweep hung >120 s at 640x360; the identical command then ran in 0.15 s and never reproduced across ~80 later sessions. Most likely Android throttling the off-screen app. | Medium | ✅ mitigated | Now surfaces as a bounded timeout (fix #2) rather than an indefinite hang, and `bridge_client` **auto-retries once** on timeout (`BRIDGE_RETRIES`). Retry is disabled when either side is `-` (stdin/stdout can't be rewound, so retrying would silently truncate output); `hw-transcode` therefore propagates exit 3 with an explanation instead. |
 | 4 | **App must stay open.** Foreground service survives backgrounding but not force-stop/swipe-away; it is not a Linux daemon. | Medium | ⚠️ mitigated | The two recoverable halves are now automatic: a `BootReceiver` restarts the service on `BOOT_COMPLETED`/`QUICKBOOT_POWERON` (so a reboot no longer leaves a dead port) and on `MY_PACKAGE_REPLACED` (so installing a new build doesn't), and the landing screen shows the Doze state with a one-tap battery-optimisation exemption. The notification is `setOngoing` with a content intent, so a backgrounded bridge is one tap from the foreground. **A force-stop still needs a manual launch** — Android deliberately blocks every receiver of a force-stopped package until the user launches it, and there is no way around that without root. |
 | 5 | **`bridge.log` unreadable from Debian.** Android 11+ scoped storage denies `/sdcard/Android/data/com.selinuxbridge.app` to every other app and to the PRoot shell. | Low | ✅ fixed | New `mode=3` streams the log file back over the same loopback socket: `bridge_client log`, or `tools/bridge-status --log`. |
-| 6 | **Only H.264, and only the codec.** No HEVC/VP9/AV1; no camera or other SELinux-gated hardware despite the app's name. | Low | ✅ fixed (codecs) | Protocol v3 adds a `codec` field: `0=h264 1=hevc 2=vp9 3=av1`, selected with `bridge_client -c hevc …` or `hw-transcode -c hevc`. `info` now enumerates every one of the four and flags which are `[hardware]`. Camera remains future work — it needs a new `mode=`, not a protocol change. |
+| 6 | **Only H.264, and only the codec.** No HEVC/VP9/AV1; no camera or other SELinux-gated hardware despite the app's name. | Low | ✅ fixed | Protocol v3 adds a `codec` field: `0=h264 1=hevc 2=vp9 3=av1`, selected with `bridge_client -c hevc …` or `hw-transcode -c hevc`. `info` now enumerates every one of the four and flags which are `[hardware]`. **Camera and microphone shipped in v6** as `mode=4`/`mode=5` — no protocol change was needed, exactly as predicted here — with `tools/bridge-webcam` and `tools/bridge-mic` on the Debian side. |
 | 7 | **No `ffmpeg` integration.** AGC-1 ships an `FFCodec`; the bridge did not. | Low | ✅ fixed | `ffmpeg/selinuxbridge.c` registers `h264_selinuxbridge` and `hevc_selinuxbridge` as real libavcodec **encoders and decoders** on the existing `AV_CODEC_ID_H264`/`AV_CODEC_ID_HEVC` ids, so both `-c:v h264_selinuxbridge` (encode) and `-c:v h264_selinuxbridge -i in.mp4` (decode) just work. See "Using it from ffmpeg" below. |
 | 8 | **No back-pressure / unbounded buffering.** The decode path read the entire elementary stream into RAM before sending anything. | Low | ✅ fixed | The Annex-B splitter is now streaming: it holds at most one NAL unit plus a read chunk. Memory is O(1) in clip length instead of O(n), and units start flowing immediately instead of after the whole input is read. Framing is byte-identical to the old splitter. |
 | 9 | **Throwaway debug signing key.** `build.sh` wrote `build/debug.keystore`, which its own `rm -rf build` then destroyed, so every rebuild changed the app's signing identity and Android refused to update in place. | Low | ✅ fixed | The key moved to `selinux-bridge/keystore/` (gitignored), outside the wipe. An existing `build/debug.keystore` is migrated automatically before the wipe so already-installed copies keep updating. Two consecutive builds now produce the same certificate digest. |
 | 10 | **Colour was silently destroyed.** Every encode produced a perfect luma plane and garbage chroma (Y PSNR 38 dB, U/V **6.7 dB**) at every resolution. `BridgeService` requested `COLOR_FormatYUV420Flexible` and then blitted the wire bytes straight into the input buffer — but "flexible" does not mean planar I420. On Qualcomm the chroma comes back **semi-planar**, U and V aliasing one region with a pixel stride of 2, and rows padded to the component's own alignment. Found only because a PSNR check happened to print U and V separately; frame counts, bitrate, decodability and luma quality all looked perfectly healthy. | **High** | ✅ fixed | New `I420.java` copies plane by plane through `getInputImage()`/`getOutputImage()`, honouring `getRowStride()` and `getPixelStride()`, so planar, semi-planar and padded layouts are all correct. The same path repacks decoder output into tightly packed I420. Covered by 10 JVM unit tests (`tools/test-i420`). |
 | 11 | **Rate control was inoperative.** Every frame was queued with `presentationTimeUs = 0`, so the encoder believed the whole clip was instantaneous. A 6 Mbps request delivered **2.98 Mbps**. | Medium | ✅ fixed | Frames are now queued at `frameIndex * 1_000_000 / fps` in both directions. |
-| 12 | **No tests, and the ones that mattered were untestable.** Everything was verified by hand against a live phone, so nothing could be checked before an install tap, and failure modes (a bridge that stalls, a bridge that is out of slots, a semi-planar chroma layout) could not be reproduced on demand at all. | Medium | ✅ fixed | `tools/selftest` runs 30 checks with no device attached — client round trips, exit codes, fault injection, flat-memory proof, both ffmpeg encoders **and both decoders**, protocol-v4 format records and mid-stream resolution changes, Annex-B parameter sets, timestamps — plus `tools/test-i420`'s 10 layout cases. `tools/mock-bridge.py` reproduces MediaCodec's awkward behaviour deliberately. |
+| 12 | **No tests, and the ones that mattered were untestable.** Everything was verified by hand against a live phone, so nothing could be checked before an install tap, and failure modes (a bridge that stalls, a bridge that is out of slots, a semi-planar chroma layout) could not be reproduced on demand at all. | Medium | ✅ fixed | `tools/selftest` runs 43 checks with no device attached — client round trips, exit codes, fault injection, flat-memory proof, both ffmpeg encoders **and both decoders**, protocol-v4 format records and mid-stream resolution changes, Annex-B parameter sets, timestamps, and the v6 capture modes including refused permissions and HAL size rounding — plus `tools/test-i420`'s 10 layout cases. `tools/mock-bridge.py` reproduces MediaCodec's awkward behaviour deliberately. |
 | 13 | **Decode could not be wired into libavcodec.** The protocol never carried the decoded picture size, so a libavcodec decoder had no way to size its frames or to notice a resolution change. Callers had to know the dimensions up front and pass them in. | Medium | ✅ fixed | Protocol v4 adds decode format records (`-2 w h`), taken from the output `Image`'s own crop rectangle so they are the display size rather than the macroblock-padded coded size. `bridge_client decode` no longer takes dimensions at all, and `h264_selinuxbridge`/`hevc_selinuxbridge` now exist as decoders. |
 | 14 | **Rate control was inaccurate.** `KEY_BITRATE_MODE` was never set, so Codec2 picked its own default -- VBR on this device's `c2.qti.*.encoder` components, where the requested bitrate is only an average the encoder may exceed freely. An explicit `-b:v` came back **+25% at 2 Mbps, +31% at 6 Mbps and +34% at 12 Mbps**, measured on ordinary content rather than a synthetic worst case. (Distinct from gap #11: that was zero timestamps making the encoder think the clip was instantaneous, which *under*-shot; this is the mode itself.) | Medium | ✅ fixed | Protocol v5 carries a rate-control mode in the **high byte of the codec field**, so the 24-byte header is unchanged and a v3/v4 client -- which sends a bare 0..3 -- lands on the new CBR default automatically. `bridge_client -r cbr\|vbr\|cq`, `hw-transcode -r`, and `ffmpeg -rc_mode cbr\|vbr\|cq`. CQ reinterprets the bitrate field as a quality in 1..100. An unsupported mode falls back to plain `KEY_BIT_RATE` rather than failing the session, and `info` now lists which modes each encoder advertises. |
 | 15 | **A stale process was invisible.** Android normally kills an app's process when its package is replaced, so the next start runs the new code. A long-lived foreground service makes surviving that much more likely, and nothing then reloads it: `BootReceiver`'s `MY_PACKAGE_REPLACED` handler calls `startForegroundService()`, but that only delivers another `onStartCommand()` to the **already loaded** classes. The bridge kept serving the old protocol while the user was looking at a successful install, with no symptom at all beyond a version number that never changed. Hit for real on the v4 → v5 update. | Medium | ✅ fixed | `info` now reports the **build timestamp of the code actually answering**, and the service compares the package's `lastUpdateTime` against the value this process saw at startup. `lastUpdateTime` moves only on replacement, so a difference means the package changed *while this process was already running* — exactly the stale case, with no timing heuristic to get wrong. The app footer always shows `protocol vN · build <timestamp>`, in the same format `info` uses, so the running version can be read off the screen and compared directly. When a mismatch is detected the warning appears in `info`, in `bridge.log`, and as a banner at the top of the app carrying a **Restart now** button, which ends the process so `START_STICKY` restarts the service on the new code — refusing while any transcode is in flight. |
 | 16 | **Constant quality silently degraded to VBR.** Qualcomm splits rate control across *components*: `c2.qti.hevc.encoder` does CBR and VBR, while constant quality lives on a **separate** `c2.qti.hevc.encoder.cq`. Picking the first `c2.qti.*` match therefore handed every CQ request to a component that cannot do CQ, which then fell back to its default — VBR — and encoded anyway. `-c h264 -r cq` produced a file **byte-for-byte the same size** as `-r vbr` (7,679,474 B), i.e. the mode was doing nothing at all. Found by this round of hardware testing, in a feature added one commit earlier. | High | ✅ fixed | Component selection is now rate-control aware and prefers one that supports the requested mode, so CQ lands on `*.encoder.cq`. If no component supports it the encode is **refused**, naming what is supported (`rate control 'cq' is not supported by c2.qti.avc.encoder (supported: cbr,vbr)`), because silently substituting rate control is precisely what hid #14. |
+| 17 | **A browser cannot be given a live camera.** The bridged camera works for native applications, but a web app — a meeting in a tab, the case this was asked for — cannot have it. Chromium's only route for an injected camera is `--use-file-for-fake-video-capture`, and its `FileVideoCaptureDevice` **reads the file when the device is opened and never looks at it again**. Measured two independent ways: appending live frames while it was reading produced a constant image, and *rewriting every frame in place* 22 s after it started produced a constant image too (`means=56.0` throughout, from a file whose every byte had been changed to luma 200). Pointing the flag at a FIFO fails earlier still — `NotFoundError` at open. An earlier result that appeared to show appends working was an artifact: Chromium takes ~15 s to start here, so the append had already finished before the file was opened. **This is a Chromium limitation, not a bridge one, and no amount of work on this side can fix it.** | Medium | ⚠️ open (not fixable here) | Two partial answers ship instead of a pretended one. **Audio is genuinely solved**: `tools/bridge-mic` creates a real PulseAudio source, so `getUserMedia({audio:true})` returns live phone audio in any browser — a meeting in a tab gets working sound. For video, `tools/bridge-browser --clip SECONDS` records from the phone camera and hands Chromium that, which is real footage but a **loop, not a live feed**, and is labelled as such everywhere it appears. Native applications are unaffected and get a genuinely live camera from the FIFO. The one untried route is PipeWire plus the `xdg-desktop-portal` camera portal (`--enable-webrtc-pipewire-camera`), which Chromium *does* re-read continuously; `pipewire` is not installed here and this container has no root to install it, so it is **untested rather than ruled out**. |
 
 ## Verification of the fixes
 
@@ -786,7 +877,17 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #16 cq | `-c hevc -r cq`, real hardware, after the fix | selects `c2.qti.hevc.encoder.cq`, and quality now bites: q=40 → 15.3 MB, q=90 → 41.5 MB from the same 120 frames |
 | #16 cq | `-c h264 -r cq`, real hardware, after the fix | refused: `rate control 'cq' is not supported by c2.qti.avc.encoder (supported: cbr,vbr)` — this device ships no AVC CQ component |
 | #15 stale | v4 → v5 in-place update, real device | reproduced: APK on disk reported v5, the running bridge still reported v4, and `info` showed none of the v5 markers |
-| #12 tests | `./tools/selftest` with no device attached | **32 passed, 0 failed** |
+| #12 tests | `./tools/selftest` with no device attached | **43 passed, 0 failed** |
+| #6 camera | `bridge-webcam` + `ffmpeg` reading the FIFO, 20 frames of 640x480 | exactly **9,216,000 B** (20 × 640 × 480 × 1.5) and **18 distinct** per-frame luma means — live, changing content rather than a repeated frame |
+| #6 camera | Bridge sessions counted while nothing was reading the FIFO | **no session at all** for 3 s of idling, then exactly one the instant a reader attached — the camera is opened on demand, not held open |
+| #6 camera | Reader detaches mid-stream | `reader gone, camera released`, writer re-armed for the next reader, no orphan left behind |
+| #6 camera | `bridge-webcam status` across idle → reading → idle | reports `idle` / `streaming (reader pid …)` / `idle`, read from `/proc/*/fd` rather than inferred from the log |
+| #6 mic | `bridge-mic start`, then `parec --device=bridge_mic` | source created, made default, **rms 8486** — real signal, not silence |
+| #17 browser | Chromium `getUserMedia({audio:true})` against `bridge_mic` | device enumerated and **non-zero RMS** (0.0366 → 0.0095 as WebRTC's AGC settles) — browser audio works |
+| #17 browser | Chromium `getUserMedia({video:true})` against a **growing** file, frames appended live | `means=130.0` constant — the grey prefill, never the appended frames |
+| #17 browser | Same, with every frame **rewritten in place** from luma 64 → 200 after 22 s | `means=56.0` constant — the file is buffered at open and never re-read |
+| #17 browser | Same, pointed at a FIFO | `NotFoundError: Requested device not found` — rejected at open |
+| #17 browser | `bridge-browser --clip 3`, then Chromium `getUserMedia({video:true})` | `ok w=640 h=480 meanR=138.3 label=…/webcam-clip.y4m` — a recording from the phone camera *is* accepted as a camera, which is why `--clip` is the one video path offered |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm
@@ -810,16 +911,20 @@ key is now stable (gap #9), so it installs as an in-place update.
   from recents, or Settings → Force stop) still requires a manual launch,
   because Android blocks every receiver of a force-stopped package until
   the user opens it. That residue of gap #4 is not fixable without root.
-- **Only the video codec is wired up so far.** The app/protocol is named
-  and structured to generalize to other SELinux-blocked hardware (camera
-  capture being the most obvious next target — same DMA-BUF-style access
-  pattern, same "shell denied, real app allowed" root cause), but no
-  camera (or other) `mode=` has been implemented yet. Adding one means:
-  a new `mode=N` in the handshake, a matching branch in
-  `BridgeService.java` using the relevant Android API (`CameraX`/
-  `Camera2` for camera), and a corresponding `bridge_client` subcommand —
-  the loopback-socket plumbing and per-client threading already in place
-  would not need to change.
+- **A browser still cannot have a live camera**, and this one is not a
+  gap in the bridge: Chromium buffers `--use-file-for-fake-video-capture`
+  at open and never re-reads it, so no live source can be injected that
+  way (gap #17 has the measurements). Native applications get a genuinely
+  live camera from `bridge-webcam`'s FIFO, and browsers get **working
+  live audio** from `bridge-mic`; for browser video the honest options
+  are a recorded loop (`bridge-browser --clip`) or PipeWire, which needs
+  root to install and is therefore untested here.
+- **Sensors, GPS, NFC and the other hardware are still not bridged.**
+  The pattern generalises — a new `mode=`, a branch in
+  `BridgeService.java` using the relevant Android API, and a
+  `bridge_client` subcommand; the loopback plumbing and per-client
+  threading do not change — but only the codec, camera and microphone
+  exist today.
 - **Only H.264 and HEVC reach `ffmpeg`.** VP9 and AV1 are selectable over
   the wire (`bridge_client -c vp9`) but have no libavcodec wrapper, because
   neither has an `mp4toannexb`-style filter to normalise input framing and

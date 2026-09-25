@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+#
+# bridge-mic -- present the phone's microphone to this container as a real
+# PulseAudio source.
+#
+# Unlike the camera, this one lands properly. /dev/snd/* is denied here, so
+# there is no ALSA device to expose, but PulseAudio is a userspace daemon and
+# module-pipe-source creates a source out of a named pipe with no kernel
+# involvement, no module and no root. Anything that uses PulseAudio -- which
+# on this system is everything, including Chromium -- then sees an ordinary
+# microphone.
+#
+# The one non-obvious constraint: the PulseAudio server belongs to Termux,
+# not to this container, so the FIFO has to sit on a path that resolves
+# identically on both sides. Paths under /tmp are private to the container
+# and the server simply cannot see them -- the symptom is "Failure: Module
+# initialization failed" with no further explanation.
+#
+# Usage:
+#   bridge-mic [-s SOURCE] [-r RATE] [-c CHANNELS] [start|stop|status]
+#
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLIENT="${BRIDGE_CLIENT:-$HERE/../bridge_client}"
+
+# Visible under the same absolute path to both sides. This is load-bearing.
+SHARED_DIR="${BRIDGE_SHARED_DIR:-/data/data/com.termux/files/home/.selinux-bridge}"
+FIFO="$SHARED_DIR/mic.fifo"
+
+STATE_DIR="${BRIDGE_STATE_DIR:-$HOME/.cache/selinux-bridge}"
+PIDFILE="$STATE_DIR/mic.pid"
+MODFILE="$STATE_DIR/mic.module"
+LOGFILE="$STATE_DIR/mic.log"
+
+SOURCE=mic
+RATE=48000
+CHANNELS=1
+SOURCE_NAME=bridge_mic
+
+# getopts has no notion of long options, and --help is the first thing
+# anyone types, so translate it before the loop rather than exiting 2 on it.
+for _a in "$@"; do [ "$_a" = "--help" ] && { sed -n '2,20p' "$0"; exit 0; }; done
+
+while getopts "s:r:c:h" opt; do
+    case "$opt" in
+        s) SOURCE="$OPTARG" ;;
+        r) RATE="$OPTARG" ;;
+        c) CHANNELS="$OPTARG" ;;
+        h) sed -n '2,20p' "$0"; exit 0 ;;
+        *) exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+CMD="${1:-start}"
+
+mkdir -p "$STATE_DIR"
+
+running() {
+    [ -f "$PIDFILE" ] || return 1
+    local p
+    p="$(cat "$PIDFILE" 2>/dev/null)"
+    [ -n "$p" ] && [ -d "/proc/$p" ]
+}
+
+unload_module() {
+    if [ -f "$MODFILE" ]; then
+        pactl unload-module "$(cat "$MODFILE")" 2>/dev/null
+        rm -f "$MODFILE"
+    fi
+    # Belt and braces: an earlier run that was killed hard leaves the module
+    # loaded with no state file, and loading a second one would give two
+    # sources with the same name.
+    local idx
+    idx=$(pactl list short modules 2>/dev/null \
+          | awk -v n="source_name=$SOURCE_NAME" '$2=="module-pipe-source" && $0 ~ n {print $1}')
+    for i in $idx; do pactl unload-module "$i" 2>/dev/null; done
+}
+
+case "$CMD" in
+stop)
+    if running; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        sleep 0.3
+        running && kill -9 "$(cat "$PIDFILE")" 2>/dev/null
+    fi
+    rm -f "$PIDFILE"
+    unload_module
+    rm -f "$FIFO"
+    echo "microphone bridge stopped"
+    exit 0
+    ;;
+status)
+    if running; then
+        echo "running (pid $(cat "$PIDFILE"))"
+        pactl list short sources 2>/dev/null | grep -F "$SOURCE_NAME" || true
+        exit 0
+    fi
+    echo "not running"
+    exit 1
+    ;;
+start) ;;
+*)
+    echo "unknown command '$CMD' (want start, stop or status)" >&2
+    exit 2
+    ;;
+esac
+
+if running; then
+    echo "already running (pid $(cat "$PIDFILE")); use 'stop' first" >&2
+    exit 1
+fi
+
+if [ ! -x "$CLIENT" ]; then
+    echo "bridge_client not found at $CLIENT -- build it with selinux-bridge/build.sh" >&2
+    exit 1
+fi
+
+if ! pactl info >/dev/null 2>&1; then
+    echo "no reachable PulseAudio server (pactl info failed)" >&2
+    exit 1
+fi
+
+mkdir -p "$SHARED_DIR" 2>/dev/null || {
+    echo "cannot create $SHARED_DIR -- set BRIDGE_SHARED_DIR to a path both" >&2
+    echo "this container and the Termux PulseAudio server can see" >&2
+    exit 1
+}
+
+unload_module
+rm -f "$FIFO"
+
+# module-pipe-source creates the FIFO itself and fails if one is already
+# there, which is why it was removed above.
+MODID=$(pactl load-module module-pipe-source \
+            source_name="$SOURCE_NAME" \
+            file="$FIFO" \
+            format=s16le rate="$RATE" channels="$CHANNELS" 2>&1)
+if ! [[ "$MODID" =~ ^[0-9]+$ ]]; then
+    echo "failed to create the virtual source: $MODID" >&2
+    echo "(a path the PulseAudio server cannot see is the usual cause)" >&2
+    exit 1
+fi
+echo "$MODID" > "$MODFILE"
+
+"$CLIENT" mic -s "$SOURCE" "$RATE" "$CHANNELS" 0 "$FIFO" >>"$LOGFILE" 2>&1 </dev/null &
+echo $! > "$PIDFILE"
+
+sleep 1
+if ! running; then
+    echo "microphone feed failed to start; last log lines:" >&2
+    tail -5 "$LOGFILE" >&2
+    unload_module
+    rm -f "$PIDFILE"
+    exit 1
+fi
+
+# Make it the default, otherwise getUserMedia({audio:true}) picks whatever
+# PulseAudio had as default -- usually a sink monitor, which is silent and
+# looks exactly like a broken microphone.
+pactl set-default-source "$SOURCE_NAME" >/dev/null 2>&1
+
+cat <<EOF
+microphone bridge running
+  source:  $SOURCE ($RATE Hz, $CHANNELS ch, s16le)
+  pulse:   $SOURCE_NAME (now the default source)
+  fifo:    $FIFO
+
+Check it:
+  parec --device=$SOURCE_NAME --file-format=wav /tmp/mic-test.wav
+EOF

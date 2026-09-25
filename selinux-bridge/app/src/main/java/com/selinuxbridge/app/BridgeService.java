@@ -1,12 +1,19 @@
 package com.selinuxbridge.app;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.graphics.Rect;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraManager;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
 import android.media.Image;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
@@ -15,6 +22,7 @@ import android.media.MediaFormat;
 import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
+import android.util.Size;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -52,7 +60,7 @@ import java.util.concurrent.TimeUnit;
  * for the transcript): 30-frame encode -> valid H.264 -> decode -> 30
  * frames back, using c2.qti.* hardware codec components.
  *
- * Wire protocol v5 (all integers big-endian / DataInputStream/
+ * Wire protocol v6 (all integers big-endian / DataInputStream/
  * DataOutputStream network order):
  *
  *   Client -> Server, once per connection:
@@ -63,6 +71,11 @@ import java.util.concurrent.TimeUnit;
  *                        3 = log    (streams back this app's bridge.log,
  *                            which Android scoped storage otherwise hides
  *                            from the Debian side; other fields ignored)
+ *                        4 = camera (new in v6; no client input is read,
+ *                            the server pushes I420 frames until the
+ *                            client hangs up or the frame budget is spent)
+ *                        5 = microphone (new in v6; likewise push-only,
+ *                            carrying signed 16-bit little-endian PCM)
  *     int32 width
  *     int32 height      (decode may send 0 x 0: the real size comes back
  *                        in a format record, see below)
@@ -109,6 +122,45 @@ import java.util.concurrent.TimeUnit;
  *   For modes 2 and 3, the server sends one or more payload chunks (a text
  *   diagnostics report, or the log file's contents) followed by the -1 EOS
  *   marker, then closes. No client input is read.
+ *
+ *   Modes 4 and 5, new in v6, reuse the header fields rather than growing
+ *   it, so a v5 parser still reads a v6 stream's shape correctly:
+ *
+ *     mode 4, camera:
+ *       width, height   requested picture size. This is a *hint*: a camera
+ *                       advertises a fixed set of sizes, so the closest one
+ *                       is used and the real size is announced with the
+ *                       same `int32 -2, int32 w, int32 h` format record
+ *                       that v4 added for decode. Read it; do not assume.
+ *       fps             requested frame rate, mapped to the nearest AE
+ *                       target range the camera advertises.
+ *       bitrate         maximum number of frames to send; 0 = until the
+ *                       client hangs up.
+ *       codec bits 0-7  camera index in the bridge's own ordering, which is
+ *                       back cameras first then front: 0 = rear, 1 = selfie.
+ *                       Raw HAL ids are not stable enough to expose.
+ *       Output is a format record followed by tightly packed I420 frames,
+ *       then the -1 EOS marker. Frames are *dropped* rather than queued if
+ *       the client reads slowly, because latency matters more than
+ *       completeness for a live camera.
+ *
+ *     mode 5, microphone:
+ *       width           sample rate in Hz; 0 selects 48000.
+ *       height          channel count, 1 or 2; 0 selects mono.
+ *       fps             ignored.
+ *       bitrate         maximum seconds to capture; 0 = until the client
+ *                       hangs up.
+ *       codec bits 0-7  audio source: 0 = MIC, 1 = VOICE_COMMUNICATION
+ *                       (platform echo cancellation and noise suppression),
+ *                       2 = CAMCORDER, 3 = UNPROCESSED.
+ *       Output is a format record -- the same -2 shape, carrying sample
+ *       rate and channel count instead of width and height -- followed by
+ *       chunks of signed 16-bit little-endian PCM, then -1.
+ *
+ *   Both capture modes need a *runtime* permission that the user grants in
+ *   the app. If it is missing the server fails the session with a readable
+ *   error at status time rather than returning an empty stream, since a
+ *   silent empty stream is indistinguishable from a broken camera.
  */
 public class BridgeService extends Service {
     private static final String TAG = "SELinuxBridge";
@@ -132,7 +184,7 @@ public class BridgeService extends Service {
      * "info" report both read it, so what the screen claims and what the
      * bridge answers cannot drift apart.
      */
-    static final int PROTOCOL_VERSION = 5;
+    static final int PROTOCOL_VERSION = 6;
 
     /**
      * Build time of this code. Seconds are kept: iterating on the bridge
@@ -187,7 +239,7 @@ public class BridgeService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(1, buildNotification());
+        startBridgeForeground();
         if (serverThread == null) {
             serverThread = new Thread(this::serverLoop, "bridge-accept");
             serverThread.start();
@@ -532,6 +584,67 @@ public class BridgeService extends Service {
         return null;
     }
 
+    /**
+     * Capture half of the diagnostics: which cameras exist under the
+     * bridge's own indexing, what sizes they will actually give, and
+     * whether the runtime grants are in place. The permission lines matter
+     * most -- a denied grant is by far the likeliest reason a capture
+     * session fails, and it is invisible from the Debian side otherwise.
+     */
+    private String captureReport() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("capture  [protocol v6]\n");
+
+        boolean cam = granted(Manifest.permission.CAMERA);
+        boolean mic = granted(Manifest.permission.RECORD_AUDIO);
+        sb.append("  permission CAMERA: ").append(cam ? "granted" : "DENIED").append("\n");
+        sb.append("  permission RECORD_AUDIO: ").append(mic ? "granted" : "DENIED").append("\n");
+        if (!cam || !mic) {
+            sb.append("  -> open the app on the phone to grant the missing one;"
+                    + " capture sessions are refused without it\n");
+        }
+
+        CameraManager cm = (CameraManager) getSystemService(CAMERA_SERVICE);
+        if (cm == null) {
+            sb.append("  cameras: (no camera service)\n");
+        } else {
+            try {
+                List<String> ids = CameraSource.orderedCameraIds(cm);
+                if (ids.isEmpty()) sb.append("  cameras: (none)\n");
+                for (int i = 0; i < ids.size(); i++) {
+                    String id = ids.get(i);
+                    sb.append("  camera ").append(i).append(" [hal id ").append(id)
+                      .append(", ").append(CameraSource.facingOf(cm, id)).append("]");
+                    Size[] sizes = CameraSource.supportedSizes(cm, id);
+                    if (sizes.length == 0) {
+                        sb.append(" (no YUV_420_888 sizes)");
+                    } else {
+                        // Largest and a couple of webcam-sized options: the
+                        // full list runs to dozens of entries.
+                        Size max = sizes[0];
+                        for (Size s : sizes) {
+                            if ((long) s.getWidth() * s.getHeight()
+                                    > (long) max.getWidth() * max.getHeight()) max = s;
+                        }
+                        sb.append(" max ").append(max.getWidth()).append("x").append(max.getHeight())
+                          .append(", ").append(sizes.length).append(" sizes");
+                    }
+                    sb.append("\n");
+                }
+            } catch (CameraAccessException e) {
+                sb.append("  cameras: enumeration failed: ").append(e.getMessage()).append("\n");
+            }
+        }
+
+        sb.append("  audio sources: 0=MIC 1=VOICE_COMMUNICATION 2=CAMCORDER 3=UNPROCESSED\n");
+        int minBuf = AudioRecord.getMinBufferSize(48000,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        sb.append("  48000Hz mono s16 min buffer: ")
+          .append(minBuf > 0 ? (minBuf + " bytes") : ("unsupported (" + minBuf + ")"))
+          .append("\n\n");
+        return sb.toString();
+    }
+
     private String infoReport() {
         StringBuilder sb = new StringBuilder();
         sb.append("SELinux Hardware Bridge diagnostics\n");
@@ -576,6 +689,7 @@ public class BridgeService extends Service {
             if (!any) sb.append("  (none)\n");
             sb.append("\n");
         }
+        sb.append(captureReport());
         return sb.toString();
     }
 
@@ -611,8 +725,20 @@ public class BridgeService extends Service {
                 return;
             }
 
+            if (mode == 4) {
+                handleCamera(out, width, height, fps, bitrate, codecId);
+                return;
+            }
+
+            if (mode == 5) {
+                handleMicrophone(out, width, height, bitrate, codecId);
+                return;
+            }
+
             if (mode != 0 && mode != 1) {
-                writeErrorStatus(out, "unknown mode " + mode);
+                writeErrorStatus(out, "unknown mode " + mode
+                        + " (expected 0=encode, 1=decode, 2=info, 3=log,"
+                        + " 4=camera, 5=microphone)");
                 return;
             }
 
@@ -706,6 +832,169 @@ public class BridgeService extends Service {
             log("client session failed: " + e);
         }
         log("client disconnected");
+    }
+
+    /**
+     * True when the user has granted a runtime permission to this app.
+     * Capture modes check this up front: starting AudioRecord or opening a
+     * camera without the grant produces an empty stream or an opaque HAL
+     * error, and neither tells the person on the Debian side what to do
+     * about it.
+     */
+    private boolean granted(String permission) {
+        return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void handleCamera(DataOutputStream out, int width, int height,
+                              int fps, int maxFrames, int cameraIndex) throws IOException {
+        if (!granted(Manifest.permission.CAMERA)) {
+            log("camera session refused: CAMERA not granted");
+            writeErrorStatus(out, "the bridge app has not been granted CAMERA."
+                    + " Open SELinux Hardware Bridge on the phone and allow camera"
+                    + " access, then retry.");
+            return;
+        }
+        if (width <= 0 || height <= 0) {
+            writeErrorStatus(out, "camera needs a positive size hint, got "
+                    + width + "x" + height);
+            return;
+        }
+        if (maxFrames < 0) {
+            writeErrorStatus(out, "frame budget must be >= 0 (0 means unlimited), got "
+                    + maxFrames);
+            return;
+        }
+
+        /*
+         * Deliberately not gated on CODEC_SLOTS. Those permits model Codec2
+         * instances; a camera stream holds none, and making a webcam wait on
+         * a transcode -- or vice versa -- would be a bug, not caution.
+         */
+        startBridgeForeground();
+        try {
+            writeOkStatus(out, "camera:" + cameraIndex);
+            int sent = CameraSource.stream(this, cameraIndex, width, height, fps,
+                    maxFrames, new CameraSource.FrameSink() {
+                        @Override public void format(int w, int h) throws IOException {
+                            out.writeInt(-2);
+                            out.writeInt(w);
+                            out.writeInt(h);
+                            out.flush();
+                        }
+                        @Override public void frame(byte[] data) throws IOException {
+                            out.writeInt(data.length);
+                            out.write(data);
+                            out.flush();
+                        }
+                    }, this::log);
+            out.writeInt(-1);
+            out.flush();
+            log("camera session finished after " + sent + " frame(s)");
+        } catch (IOException e) {
+            /*
+             * The status line is long gone by now, so there is nowhere to put
+             * a message: report it in the log and drop the connection, which
+             * is what a client's short read already means.
+             */
+            log("camera session failed: " + e.getMessage());
+            throw e;
+        }
+    }
+
+    private void handleMicrophone(DataOutputStream out, int sampleRate, int channels,
+                                  int maxSeconds, int sourceId) throws IOException {
+        if (!granted(Manifest.permission.RECORD_AUDIO)) {
+            log("microphone session refused: RECORD_AUDIO not granted");
+            writeErrorStatus(out, "the bridge app has not been granted RECORD_AUDIO."
+                    + " Open SELinux Hardware Bridge on the phone and allow microphone"
+                    + " access, then retry.");
+            return;
+        }
+        if (maxSeconds < 0) {
+            writeErrorStatus(out, "capture limit must be >= 0 seconds (0 means"
+                    + " unlimited), got " + maxSeconds);
+            return;
+        }
+        if (MicSource.androidSource(sourceId) < 0) {
+            writeErrorStatus(out, "unknown audio source " + sourceId
+                    + " (expected 0=mic, 1=voice_communication, 2=camcorder,"
+                    + " 3=unprocessed)");
+            return;
+        }
+
+        startBridgeForeground();
+        try {
+            writeOkStatus(out, "mic:" + MicSource.sourceName(sourceId));            long bytes = MicSource.stream(sampleRate, channels, sourceId, maxSeconds,
+                    new MicSource.AudioSink() {
+                        @Override public void format(int rate, int ch) throws IOException {
+                            out.writeInt(-2);
+                            out.writeInt(rate);
+                            out.writeInt(ch);
+                            out.flush();
+                        }
+                        @Override public void chunk(byte[] data, int len) throws IOException {
+                            out.writeInt(len);
+                            out.write(data, 0, len);
+                            out.flush();
+                        }
+                    }, this::log);
+            out.writeInt(-1);
+            out.flush();
+            log("microphone session finished after " + bytes + " byte(s)");
+        } catch (IOException e) {
+            log("microphone session failed: " + e.getMessage());
+            throw e;
+        }
+    }
+
+    /**
+     * Goes foreground with a service type mask that matches the grants we
+     * actually hold.
+     *
+     * This is not defensive padding. The manifest declares
+     * specialUse|camera|microphone, and a bare startForeground() asks for
+     * every declared type at once; from Android 14 on, asking for the
+     * camera or microphone type without the matching runtime grant throws
+     * SecurityException. The bridge would then fail to start *at all* --
+     * breaking encode and decode, which need no permission -- purely
+     * because a capture grant the user has not given yet was missing. So
+     * the mask is computed from what is granted right now.
+     *
+     * Re-called when a capture session begins, because a grant made after
+     * the service went foreground would otherwise leave it running with a
+     * type that does not cover the capture it is about to do.
+     */
+    private void startBridgeForeground() {
+        Notification n = buildNotification();
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            startForeground(1, n);
+            return;
+        }
+        int type = 0;
+        if (Build.VERSION.SDK_INT >= 34) {
+            type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
+        }
+        if (granted(Manifest.permission.CAMERA)) {
+            type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
+        }
+        if (granted(Manifest.permission.RECORD_AUDIO)) {
+            type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+        }
+        if (type == 0) {
+            startForeground(1, n);
+            return;
+        }
+        try {
+            startForeground(1, n, type);
+        } catch (Throwable t) {
+            // Better a bridge with a vaguer service type than no bridge.
+            Log.w(TAG, "typed startForeground(" + type + ") rejected, falling back", t);
+            try {
+                startForeground(1, n);
+            } catch (Throwable t2) {
+                Log.e(TAG, "startForeground failed outright", t2);
+            }
+        }
     }
 
     private static void writeChunk(DataOutputStream out, byte[] data) throws IOException {

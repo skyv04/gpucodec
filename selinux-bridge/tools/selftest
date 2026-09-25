@@ -460,6 +460,134 @@ else
     fi
 fi
 
+head_ "Capture (protocol v6)"
+
+# The bridge rounds a size request to something the camera really offers, so
+# a client must read the announced geometry rather than assume it got what it
+# asked for. 700x500 is not a real camera size; 640x480 is the nearest.
+if BRIDGE_PORT=$PORT ./bridge_client camera 700 500 10 5 "$TMP/cam.y4m" \
+        >/dev/null 2>"$TMP/cam.err"; then
+    hdr=$(head -c 60 "$TMP/cam.y4m" | head -1)
+    if echo "$hdr" | grep -q 'W640 H480'; then
+        ok "camera capture honours the announced size, not the requested one"
+    else
+        bad "camera Y4M header was '$hdr', expected W640 H480"
+    fi
+else
+    bad "camera capture exited non-zero: $(tail -1 "$TMP/cam.err")"
+fi
+
+# Five frames of 640x480 I420 plus the header and five FRAME markers.
+if [ -s "$TMP/cam.y4m" ]; then
+    want=$(( 640 * 480 * 3 / 2 * 5 ))
+    have=$(wc -c <"$TMP/cam.y4m")
+    if [ "$have" -gt "$want" ] && [ "$have" -lt $(( want + 200 )) ]; then
+        ok "camera capture delivers exactly the requested frame budget"
+    else
+        bad "camera capture produced $have bytes, expected just over $want"
+    fi
+fi
+
+# ffmpeg is the real arbiter of whether the Y4M framing is correct: a wrong
+# header or a missing FRAME marker still produces a plausible-looking file.
+if ffprobe -v error -count_frames -select_streams v:0 \
+        -show_entries stream=nb_read_frames -of csv=p=0 \
+        "$TMP/cam.y4m" 2>/dev/null | grep -q '^5$'; then
+    ok "the captured Y4M is well-formed enough for ffmpeg to read all 5 frames"
+else
+    bad "ffmpeg could not read 5 frames back out of the captured Y4M"
+fi
+
+# --raw must drop the container entirely, for a caller that already knows the
+# geometry and wants no framing overhead.
+if BRIDGE_PORT=$PORT ./bridge_client camera --raw 640 480 10 3 "$TMP/cam.i420" \
+        >/dev/null 2>&1; then
+    want=$(( 640 * 480 * 3 / 2 * 3 ))
+    have=$(wc -c <"$TMP/cam.i420")
+    if [ "$have" = "$want" ]; then
+        ok "--raw emits bare I420 with no container bytes"
+    else
+        bad "--raw produced $have bytes, expected exactly $want"
+    fi
+else
+    bad "--raw capture exited non-zero"
+fi
+
+if BRIDGE_PORT=$PORT ./bridge_client mic 48000 1 1 "$TMP/mic.pcm" \
+        >/dev/null 2>&1; then
+    want=$(( 48000 * 2 ))
+    have=$(wc -c <"$TMP/mic.pcm")
+    if [ "$have" = "$want" ]; then
+        ok "microphone capture delivers one second of 48kHz mono s16"
+    else
+        bad "microphone capture produced $have bytes, expected $want"
+    fi
+else
+    bad "microphone capture exited non-zero"
+fi
+
+# Silence is what a broken capture path looks like, so the test has to prove
+# the samples are not all zero rather than just counting bytes.
+if [ -s "$TMP/mic.pcm" ] && python3 -c "
+import sys
+d = open('$TMP/mic.pcm','rb').read()
+sys.exit(0 if any(d) else 1)" 2>/dev/null; then
+    ok "captured audio is real signal, not silence"
+else
+    bad "captured audio was entirely zero"
+fi
+
+# A denied runtime grant is the likeliest real-world failure and must arrive
+# as a readable error at handshake time, not as an empty stream.
+DENY_PORT=$((PORT + 6))
+MOCK_DENY_CAMERA=1 MOCK_DENY_MIC=1 python3 tools/mock-bridge.py "$DENY_PORT" \
+    >"$TMP/deny.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+if BRIDGE_PORT=$DENY_PORT ./bridge_client camera 640 480 10 5 "$TMP/deny.y4m" \
+        >/dev/null 2>"$TMP/deny.err"; then
+    bad "a camera session succeeded without the CAMERA grant"
+elif grep -qi "not been granted CAMERA" "$TMP/deny.err"; then
+    ok "an ungranted camera is refused with an actionable message"
+else
+    bad "an ungranted camera failed without saying why"
+fi
+
+if BRIDGE_PORT=$DENY_PORT ./bridge_client mic 48000 1 1 "$TMP/deny.pcm" \
+        >/dev/null 2>"$TMP/denym.err"; then
+    bad "a microphone session succeeded without the RECORD_AUDIO grant"
+elif grep -qi "not been granted RECORD_AUDIO" "$TMP/denym.err"; then
+    ok "an ungranted microphone is refused with an actionable message"
+else
+    bad "an ungranted microphone failed without saying why"
+fi
+
+# An out-of-range camera index must be named, not clamped to a working one.
+if BRIDGE_PORT=$PORT ./bridge_client camera -i 9 640 480 10 2 "$TMP/badcam.y4m" \
+        >/dev/null 2>"$TMP/badcam.err"; then
+    bad "an out-of-range camera index was silently accepted"
+elif grep -qi "out of range" "$TMP/badcam.err"; then
+    ok "an out-of-range camera index is refused by name"
+else
+    bad "an out-of-range camera index failed without saying why"
+fi
+
+# The selfie camera must be reachable, or the index is decorative.
+if BRIDGE_PORT=$PORT ./bridge_client camera -i 1 640 480 10 2 "$TMP/cam1.y4m" \
+        >/dev/null 2>&1 && [ -s "$TMP/cam1.y4m" ]; then
+    ok "the second camera is selectable with -i 1"
+else
+    bad "-i 1 failed to capture from the second camera"
+fi
+
+# Chromium paces its fake capture device from the Y4M frame-rate field, so a
+# wrong value there makes a webcam run fast or slow with no other symptom.
+if head -c 60 "$TMP/cam.y4m" | head -1 | grep -q 'F10:1'; then
+    ok "the Y4M header declares the requested frame rate"
+else
+    bad "the Y4M header carries the wrong frame rate"
+fi
+
 head_ "Result"
 echo "  $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

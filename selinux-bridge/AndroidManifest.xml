@@ -12,6 +12,25 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Protocol v6 capture modes. Both of these are *runtime* permissions:
+         declaring them here only makes them requestable, and MainActivity
+         must still ask the user. A capture session that starts without the
+         grant fails at open() time, not at build time, so the service
+         checks the grant itself and returns a real error rather than
+         handing back an empty stream. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Android 14+ requires the matching FGS type permission for a
+         foreground service that touches the camera or the microphone. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- The bridge is useful on a device with no camera at all (it started
+         life as a codec bridge), so nothing here may be load-bearing. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <!-- Gap #4 mitigations: bring the bridge back after a reboot or an
          in-place update, and let the user exempt it from Doze so a long
          idle period can't quietly stop it. Neither makes the service a
@@ -33,9 +52,12 @@
             </intent-filter>
         </activity>
 
+        <!-- "camera" and "microphone" are additive: without them in this
+             list, startForeground() throws the moment a v6 capture session
+             opens, even though the runtime permission was granted. -->
         <service android:name=".BridgeService"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse|camera|microphone" />
 
         <receiver android:name=".BootReceiver"
             android:exported="true"

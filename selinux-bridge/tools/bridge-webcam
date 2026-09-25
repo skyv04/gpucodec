@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+#
+# bridge-webcam -- serve the phone's camera into this container as a live
+# Y4M stream on a named pipe.
+#
+# Scope, stated plainly, because it was established by measurement and it
+# decides what this tool can be used for:
+#
+#   Native consumers (ffplay, mpv, VLC, ffmpeg, OBS): WORKS.
+#   Browsers: DOES NOT WORK. See the note at the end.
+#
+# There is no way to create /dev/video0 here. That needs v4l2loopback, hence
+# a kernel module, hence CAP_SYS_MODULE and a module tree; this container has
+# neither (CapEff is 0000000000000000, /lib/modules does not exist). So
+# anything that insists on a V4L2 node cannot be served at all.
+#
+# A FIFO is the right shape for everything else. Opening it for writing
+# blocks until a reader arrives, which gives on-demand capture for free: the
+# camera is opened when something actually wants frames and released the
+# moment it stops, so the phone's camera indicator is lit only while the
+# stream is genuinely being watched. A reader also always starts at the live
+# edge, because a pipe has no history to catch up on.
+#
+# Why not a regular file: Chromium's --use-file-for-fake-video-capture is the
+# only way to give a browser a synthetic camera, and it reads the file into
+# memory when the device is opened. Measured here: appending to the file
+# afterwards changes nothing, and rewriting its frames in place changes
+# nothing either -- the picture stays on whatever was in the file at open
+# time. A file can therefore only ever serve a browser a fixed recording,
+# never a live camera, so there is no point paying for one.
+#
+# Usage:
+#   bridge-webcam [-i INDEX] [-s WxH] [-f FPS] <command>
+#   commands: start | stop | status | path
+#
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLIENT="${BRIDGE_CLIENT:-$HERE/../bridge_client}"
+
+STATE_DIR="${BRIDGE_STATE_DIR:-$HOME/.cache/selinux-bridge}"
+FIFO="$STATE_DIR/webcam.y4m"
+PIDFILE="$STATE_DIR/webcam-sup.pid"
+CAMPIDFILE="$STATE_DIR/webcam-cam.pid"
+LOGFILE="$STATE_DIR/webcam.log"
+GEOMFILE="$STATE_DIR/webcam.geom"
+
+CAM_INDEX=0
+SIZE=1280x720
+FPS=30
+
+# getopts has no notion of long options, and --help is the first thing
+# anyone types, so translate it before the loop rather than exiting 2 on it.
+for _a in "$@"; do [ "$_a" = "--help" ] && { sed -n '2,34p' "$0"; exit 0; }; done
+
+while getopts "i:s:f:h" opt; do
+    case "$opt" in
+        i) CAM_INDEX="$OPTARG" ;;
+        s) SIZE="$OPTARG" ;;
+        f) FPS="$OPTARG" ;;
+        h) sed -n '2,34p' "$0"; exit 0 ;;
+        *) exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+CMD="${1:-start}"
+
+WIDTH="${SIZE%x*}"
+HEIGHT="${SIZE#*x}"
+mkdir -p "$STATE_DIR"
+
+alive() {
+    local pf="$1" p
+    [ -f "$pf" ] || return 1
+    p="$(cat "$pf" 2>/dev/null)"
+    [ -n "$p" ] && [ -d "/proc/$p" ]
+}
+
+# Who is reading the stream right now? Anything holding the FIFO open that
+# is not our own writer counts. The writer is skipped because it always
+# holds the FIFO once open() has returned, so counting it would make the
+# stream look busy forever.
+readers() {
+    local writer="" d pid
+    [ -f "$CAMPIDFILE" ] && writer="$(cat "$CAMPIDFILE" 2>/dev/null)"
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        [ "$pid" = "$writer" ] && continue
+        [ "$pid" = "$$" ] && continue
+        if ls -l "$d/fd" 2>/dev/null | grep -qF -- "$FIFO"; then
+            printf ' %s' "$pid"
+        fi
+    done
+}
+
+kill_pidfile() {
+    local pf="$1" p
+    if alive "$pf"; then
+        p="$(cat "$pf")"
+        kill "$p" 2>/dev/null
+        for _ in $(seq 1 20); do
+            [ -d "/proc/$p" ] || break
+            sleep 0.1
+        done
+        [ -d "/proc/$p" ] && kill -9 "$p" 2>/dev/null
+    fi
+    rm -f "$pf"
+}
+
+# One capture session per reader, forever. The client's open of the FIFO
+# blocks inside this loop until someone opens the other end, so the loop
+# spins only as fast as readers come and go, not continuously.
+supervise() {
+    while :; do
+        echo "[$(date +%T)] waiting for a reader on $FIFO" >>"$LOGFILE"
+        "$CLIENT" camera -i "$CAM_INDEX" "$WIDTH" "$HEIGHT" "$FPS" 0 "$FIFO" \
+            >>"$LOGFILE" 2>&1 </dev/null &
+        echo $! > "$CAMPIDFILE"
+        wait $! 2>/dev/null
+        echo "[$(date +%T)] reader gone, camera released" >>"$LOGFILE"
+        rm -f "$CAMPIDFILE"
+        # A reader that closes and immediately reopens would otherwise spin
+        # this loop hard if the camera is failing to open at all.
+        sleep 0.5
+    done
+}
+
+case "$CMD" in
+stop)
+    kill_pidfile "$PIDFILE"
+    kill_pidfile "$CAMPIDFILE"
+    rm -f "$FIFO" "$GEOMFILE"
+    echo "webcam stream stopped"
+    exit 0
+    ;;
+status)
+    if alive "$PIDFILE"; then
+        echo "running (supervisor pid $(cat "$PIDFILE"))"
+        echo "  stream: $FIFO"
+        [ -f "$GEOMFILE" ] && echo "  format: $(cat "$GEOMFILE")"
+        # Ground truth beats reading the log: the camera runs exactly when
+        # something other than our own writer holds the FIFO open, so ask
+        # the kernel rather than inferring it from the last line logged.
+        reader_pids=$(readers)
+        if [ -n "$reader_pids" ]; then
+            echo "  camera: streaming (reader pid(s):$reader_pids)"
+        else
+            echo "  camera: idle (nothing is reading; camera is released)"
+        fi
+        exit 0
+    fi
+    echo "not running"
+    exit 1
+    ;;
+path)
+    echo "$FIFO"
+    exit 0
+    ;;
+start) ;;
+*)
+    echo "unknown command '$CMD' (want start, stop, status or path)" >&2
+    exit 2
+    ;;
+esac
+
+if alive "$PIDFILE"; then
+    echo "already running (pid $(cat "$PIDFILE")); use 'stop' first" >&2
+    exit 1
+fi
+if [ ! -x "$CLIENT" ]; then
+    echo "bridge_client not found at $CLIENT -- build it with selinux-bridge/build.sh" >&2
+    exit 1
+fi
+
+# One short capture up front. It learns the size the camera really gives --
+# it rounds the request to a size it advertises -- and, more usefully, fails
+# here with a readable message if the runtime permission is missing, rather
+# than silently at the moment a call starts.
+PROBE="$STATE_DIR/probe.y4m"
+rm -f "$PROBE"
+if ! "$CLIENT" camera -i "$CAM_INDEX" "$WIDTH" "$HEIGHT" "$FPS" 2 "$PROBE" \
+        >>"$LOGFILE" 2>"$STATE_DIR/probe.err"; then
+    echo "could not open the camera:" >&2
+    sed 's/^/  /' "$STATE_DIR/probe.err" >&2
+    rm -f "$PROBE" "$STATE_DIR/probe.err"
+    exit 1
+fi
+REAL_W="$(head -c 200 "$PROBE" | head -1 | sed -n 's/.*W\([0-9]*\).*/\1/p')"
+REAL_H="$(head -c 200 "$PROBE" | head -1 | sed -n 's/.*H\([0-9]*\).*/\1/p')"
+rm -f "$PROBE" "$STATE_DIR/probe.err"
+: "${REAL_W:=$WIDTH}" "${REAL_H:=$HEIGHT}"
+echo "${REAL_W}x${REAL_H} @ ${FPS}fps yuv420p" > "$GEOMFILE"
+
+rm -f "$FIFO"
+mkfifo "$FIFO" || { echo "could not create $FIFO" >&2; exit 1; }
+
+supervise >>"$LOGFILE" 2>&1 </dev/null &
+echo $! > "$PIDFILE"
+sleep 0.5
+if ! alive "$PIDFILE"; then
+    echo "supervisor failed to start; last log lines:" >&2
+    tail -5 "$LOGFILE" >&2
+    exit 1
+fi
+
+cat <<EOF
+webcam stream ready
+  camera: index $CAM_INDEX, ${REAL_W}x${REAL_H} @ ${FPS}fps (requested ${WIDTH}x${HEIGHT})
+  stream: $FIFO
+  idle:   the camera stays closed until something opens the stream
+
+Watch it:
+  ffplay -f yuv4mpegpipe -i $FIFO
+  mpv --demuxer=lavf --demuxer-lavf-format=yuv4mpegpipe $FIFO
+
+Record it, hardware-encoded by the same bridge:
+  ffmpeg -f yuv4mpegpipe -i $FIFO -c:v h264_selinuxbridge -b:v 4M out.mp4
+
+Browsers cannot use this; see the note at the top of $0.
+EOF

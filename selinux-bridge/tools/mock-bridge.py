@@ -23,14 +23,20 @@ stream that corresponds to the input rather than a canned replay.
 Usage:  mock-bridge.py [port]           (default 9401)
 Env:    MOCK_RESIZE_AT=N   halve the picture size from decoded frame N on
         MOCK_UNSUPPORTED_RC=cq[,vbr]  refuse those rate-control modes
+        MOCK_DENY_CAMERA=1 / MOCK_DENY_MIC=1  refuse capture the way an
+                            ungranted runtime permission does
+        MOCK_CAMERAS=N     how many cameras to pretend exist (default 2)
+        MOCK_CAMERA_EXACT=1  honour the requested size instead of rounding
 """
 import os
+import math
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9401
 RESIZE_AT = int(os.environ.get("MOCK_RESIZE_AT", "0"))
@@ -38,6 +44,15 @@ RESIZE_AT = int(os.environ.get("MOCK_RESIZE_AT", "0"))
 # Real Qualcomm parts split these across components (CQ lives on a separate
 # c2.qti.*.encoder.cq), so the refusal path needs covering without a device.
 UNSUPPORTED_RC = {m for m in os.environ.get("MOCK_UNSUPPORTED_RC", "").split(",") if m}
+
+# Capture knobs. The deny switches exist because a missing runtime grant is
+# the single likeliest reason a capture session fails on a real phone, and
+# the refusal has to be a readable error rather than an empty stream.
+DENY_CAMERA = os.environ.get("MOCK_DENY_CAMERA", "") not in ("", "0")
+DENY_MIC = os.environ.get("MOCK_DENY_MIC", "") not in ("", "0")
+MOCK_CAMERAS = int(os.environ.get("MOCK_CAMERAS", "2"))
+# Off by default so the mock rounds the requested size like a real HAL does.
+CAMERA_EXACT = os.environ.get("MOCK_CAMERA_EXACT", "") not in ("", "0")
 
 # Wire codec id -> (ffmpeg encoder, decoder demuxer, component name)
 CODECS = {
@@ -244,6 +259,97 @@ def handle_decode(conn, f, codec):
           + (f" (resized at {RESIZE_AT})" if RESIZE_AT else ""), flush=True)
 
 
+def handle_camera(conn, w, h, fps, max_frames, cam_index):
+    """
+    Synthetic camera. Emits a format record then I420 frames.
+
+    The size is deliberately *not* the one requested unless MOCK_CAMERA_EXACT
+    is set: a real camera rounds the request to a size it actually offers,
+    and a client that assumes it got what it asked for is broken in a way
+    that only shows up on hardware. Making the mock round too means the
+    selftest catches it here instead.
+    """
+    if DENY_CAMERA:
+        msg = (b"the bridge app has not been granted CAMERA."
+               b" Open SELinux Hardware Bridge on the phone and allow camera"
+               b" access, then retry.")
+        conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+        return
+    if cam_index >= MOCK_CAMERAS:
+        msg = ("camera index %d out of range (have %d: 0=back, 1=front)"
+               % (cam_index, MOCK_CAMERAS)).encode()
+        conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+        return
+
+    rw, rh = (w, h) if CAMERA_EXACT else round_to_camera_size(w, h)
+    name = ("camera:%d" % cam_index).encode()
+    conn.sendall(struct.pack(">ii", 0, len(name)) + name)
+    conn.sendall(struct.pack(">iii", -2, rw, rh))
+
+    n = max_frames if max_frames > 0 else 0
+    delay = 1.0 / fps if fps > 0 else 0.0
+    i = 0
+    while n == 0 or i < n:
+        # A moving luma ramp: a static frame would pass a test that only
+        # checks sizes even if every frame were identical.
+        y = bytes([(i * 7 + (p % 251)) & 0xff for p in range(rw)]) * rh
+        uv = b"\x80" * (rw * rh // 4)
+        frame = y + uv + uv
+        conn.sendall(struct.pack(">i", len(frame)) + frame)
+        i += 1
+        if delay:
+            time.sleep(delay)
+    conn.sendall(struct.pack(">i", -1))
+
+
+def round_to_camera_size(w, h):
+    """Nearest of a plausible fixed size list, mimicking a real HAL."""
+    sizes = [(176, 144), (320, 240), (640, 480), (1280, 720),
+             (1920, 1080), (3840, 2160)]
+    want = w * h
+    return min(sizes, key=lambda s: abs(s[0] * s[1] - want))
+
+
+def handle_mic(conn, rate, channels, max_seconds, source):
+    """Synthetic microphone: a format record then S16LE chunks."""
+    if DENY_MIC:
+        msg = (b"the bridge app has not been granted RECORD_AUDIO."
+               b" Open SELinux Hardware Bridge on the phone and allow microphone"
+               b" access, then retry.")
+        conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+        return
+    if source > 3:
+        msg = ("unknown audio source %d (expected 0=mic, 1=voice_communication,"
+               " 2=camcorder, 3=unprocessed)" % source).encode()
+        conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+        return
+
+    rate = rate if rate > 0 else 48000
+    channels = channels if channels > 0 else 1
+    names = {0: "MIC", 1: "VOICE_COMMUNICATION", 2: "CAMCORDER", 3: "UNPROCESSED"}
+    name = ("mic:%s" % names[source]).encode()
+    conn.sendall(struct.pack(">ii", 0, len(name)) + name)
+    conn.sendall(struct.pack(">iii", -2, rate, channels))
+
+    seconds = max_seconds if max_seconds > 0 else 0
+    chunk_samples = rate // 10
+    i = 0
+    while seconds == 0 or i < seconds * 10:
+        # A 440 Hz sine, so a listener can tell real audio from zeros.
+        buf = bytearray()
+        for k in range(chunk_samples):
+            t = (i * chunk_samples + k) / rate
+            v = int(12000 * math.sin(2 * math.pi * 440 * t))
+            buf += struct.pack("<h", v) * channels
+        conn.sendall(struct.pack(">i", len(buf)) + bytes(buf))
+        i += 1
+        # Unlimited capture must run in real time, or it floods the pipe
+        # far faster than a microphone ever would.
+        if seconds == 0:
+            time.sleep(0.1)
+    conn.sendall(struct.pack(">i", -1))
+
+
 def handle(conn):
     f = conn.makefile("rb")
     hdr = f.read(24)
@@ -263,6 +369,10 @@ def handle(conn):
             conn.sendall(struct.pack(">ii", 0, 3) + b"n/a")
             conn.sendall(struct.pack(">i", len(payload)) + payload)
             conn.sendall(struct.pack(">i", -1))
+        elif mode == 4:
+            handle_camera(conn, w, h, fps, br, codec)
+        elif mode == 5:
+            handle_mic(conn, w, h, br, codec)
         elif codec not in CODECS:
             msg = b"unsupported codec id"
             conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
@@ -291,7 +401,7 @@ def main():
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("127.0.0.1", PORT))
     s.listen(8)
-    print(f"[mock] v5 bridge listening on 127.0.0.1:{PORT}", flush=True)
+    print(f"[mock] v6 bridge listening on 127.0.0.1:{PORT}", flush=True)
     while True:
         c, _ = s.accept()
         threading.Thread(target=handle, args=(c,), daemon=True).start()

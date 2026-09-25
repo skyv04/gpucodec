@@ -51,6 +51,19 @@ public class MainActivity extends Activity {
 
     private TextView powerStatus;
     private TextView powerAction;
+    private TextView captureStatus;
+    private TextView captureAction;
+
+    /**
+     * Runtime permissions the capture modes need. Requested together so the
+     * user sees one pair of dialogs rather than being interrupted again the
+     * first time they try the other capture mode.
+     */
+    private static final String[] CAPTURE_PERMISSIONS = {
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO,
+    };
+    private static final int CAPTURE_REQUEST_CODE = 42;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -74,6 +87,8 @@ public class MainActivity extends Activity {
         root.addView(buildStatusCard());
         root.addView(spacer(14));
         root.addView(buildPowerCard());
+        root.addView(spacer(14));
+        root.addView(buildCaptureCard());
         root.addView(spacer(28));
         root.addView(sectionTitle("How it works"));
         root.addView(spacer(12));
@@ -305,6 +320,130 @@ public class MainActivity extends Activity {
         // The exemption is granted in a system dialog, so the only chance to
         // notice the change is on the way back into this activity.
         refreshPowerCard();
+        refreshCaptureCard();
+    }
+
+    /**
+     * Camera and microphone grants, with a one-tap request.
+     *
+     * Unlike everything else the bridge does, capture needs permissions the
+     * user must grant by hand, and a denied grant is invisible from the
+     * Debian side except as a failing session. Surfacing the state here is
+     * what makes that diagnosable without a cable.
+     */
+    private View buildCaptureCard() {
+        LinearLayout cardView = card();
+        cardView.setOrientation(LinearLayout.VERTICAL);
+
+        captureStatus = new TextView(this);
+        captureStatus.setTextColor(TEXT_MAIN);
+        captureStatus.setTypeface(captureStatus.getTypeface(), android.graphics.Typeface.BOLD);
+        captureStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+
+        TextView caption = new TextView(this);
+        caption.setText("Lets the Debian side use this phone's cameras and microphones as a "
+                + "webcam \u2014 including in a browser, for calls on the web. Nothing is "
+                + "captured until something asks for it, and the status bar shows the "
+                + "camera or mic indicator whenever it is.");
+        caption.setTextColor(TEXT_DIM);
+        caption.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        caption.setPadding(0, dp(8), 0, 0);
+
+        captureAction = new TextView(this);
+        captureAction.setTextColor(ACCENT);
+        captureAction.setTypeface(captureAction.getTypeface(), android.graphics.Typeface.BOLD);
+        captureAction.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        captureAction.setPadding(0, dp(14), 0, 0);
+        captureAction.setOnClickListener(v -> requestCapturePermissions());
+
+        cardView.addView(captureStatus);
+        cardView.addView(caption);
+        cardView.addView(captureAction);
+        refreshCaptureCard();
+        return cardView;
+    }
+
+    private boolean hasPermission(String p) {
+        return checkSelfPermission(p) == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void refreshCaptureCard() {
+        if (captureStatus == null || captureAction == null) return;
+        boolean cam = hasPermission(android.Manifest.permission.CAMERA);
+        boolean mic = hasPermission(android.Manifest.permission.RECORD_AUDIO);
+        if (cam && mic) {
+            captureStatus.setText("\u2713  Camera and microphone available");
+            captureAction.setText("Review in system settings \u203A");
+        } else if (cam) {
+            captureStatus.setText("\u26A0  Camera only \u2014 microphone not granted");
+            captureAction.setText("Allow microphone access \u203A");
+        } else if (mic) {
+            captureStatus.setText("\u26A0  Microphone only \u2014 camera not granted");
+            captureAction.setText("Allow camera access \u203A");
+        } else {
+            captureStatus.setText("\u26A0  Camera and microphone not granted");
+            captureAction.setText("Allow the bridge to use them \u203A");
+        }
+    }
+
+    private void requestCapturePermissions() {
+        boolean cam = hasPermission(android.Manifest.permission.CAMERA);
+        boolean mic = hasPermission(android.Manifest.permission.RECORD_AUDIO);
+        if (cam && mic) {
+            // Nothing left to ask for; send them where it can be revoked.
+            openAppSettings();
+            return;
+        }
+        requestPermissions(CAPTURE_PERMISSIONS, CAPTURE_REQUEST_CODE);
+    }
+
+    private void openAppSettings() {
+        try {
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(i);
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not open app settings", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                                           int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != CAPTURE_REQUEST_CODE) return;
+        refreshCaptureCard();
+
+        /*
+         * Restart the service after a grant. It goes foreground with a
+         * service type computed from the permissions held at that moment,
+         * so a service started before the grant is still running without
+         * the camera or microphone type and would be blocked from capture.
+         */
+        boolean anyGranted = false;
+        for (int r : grantResults) {
+            if (r == android.content.pm.PackageManager.PERMISSION_GRANTED) anyGranted = true;
+        }
+        if (anyGranted) {
+            startForegroundService(new Intent(this, BridgeService.class));
+            Toast.makeText(this, "Capture enabled \u2014 bridge updated",
+                    Toast.LENGTH_SHORT).show();
+        } else {
+            /*
+             * A permanent denial cannot be re-requested: the system returns
+             * "denied" without showing a dialog. Settings is the only route
+             * back, so say so rather than letting the button do nothing.
+             */
+            boolean permanent = !shouldShowRequestPermissionRationale(
+                    android.Manifest.permission.CAMERA)
+                    && !shouldShowRequestPermissionRationale(
+                    android.Manifest.permission.RECORD_AUDIO);
+            if (permanent) {
+                Toast.makeText(this, "Permission denied \u2014 enable it in app settings",
+                        Toast.LENGTH_LONG).show();
+                openAppSettings();
+            }
+        }
     }
 
     private View featureRow(String glyph, int badgeColor, String title, String desc) {
