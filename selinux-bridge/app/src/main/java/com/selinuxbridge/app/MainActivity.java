@@ -519,7 +519,7 @@ public class MainActivity extends Activity {
         box.addView(ver);
 
         TextView tv = new TextView(this);
-        tv.setText("github.com/skyv04/gpucodec");
+        tv.setText("github.com/skyv04/selinux-hardware-bridge");
         tv.setTextColor(TEXT_DIM);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         tv.setGravity(Gravity.CENTER);

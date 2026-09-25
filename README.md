@@ -1,4 +1,17 @@
-# AGC-1
+# selinux-hardware-bridge
+
+Reach your Android phone's GPU, cameras, microphone and hardware video
+codecs from a Termux/PRoot Linux container that SELinux otherwise locks
+out of all of them.
+
+Two components, both answers to the same question:
+
+| | What it is |
+|---|---|
+| **`selinux-bridge/`** | An Android app that holds the SELinux-gated hardware — `MediaCodec`, `Camera2`, `AudioRecord` — and lends it to the container over a loopback socket. Plus `ffmpeg` codecs, a webcam FIFO and a PulseAudio source on the Linux side. |
+| **AGC-1** (`agc.c`, `ffmpeg/`) | A video codec written from scratch to run entirely in GPU compute shaders, for when you want no app in the loop at all. |
+
+## AGC-1
 
 A video codec written from scratch to run entirely in GPU compute shaders,
 built for an Adreno 840 driven by Mesa/Turnip inside a Termux PRoot container.
@@ -405,7 +418,7 @@ touching it wasn't necessary to reach Shotcut/Blender.
 ### Building it
 
 ```sh
-cd gpucodec/ffmpeg
+cd selinux-hardware-bridge/ffmpeg
 ./build.sh
 ```
 

@@ -2,7 +2,8 @@
  * AGC-1 GPU compute-shader intra codec, ffmpeg encoder wrapper.
  *
  * AGC-1's actual compression pipeline lives in agc_core.h, upstream at
- * https://github.com/ (see gpucodec repo README for "Embedding AGC-1").
+ * https://github.com/skyv04/selinux-hardware-bridge (see the repo README,
+ * "Embedding AGC-1").
  * This file is just the libavcodec glue: it turns one AVFrame into one
  * AVPacket by calling into that header, using the packet framing decided
  * for this integration -- a plain concatenation of each plane's compressed
