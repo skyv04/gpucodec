@@ -102,7 +102,7 @@ public class MainActivity extends Activity {
         titles.setPadding(dp(16), 0, 0, 0);
 
         TextView title = new TextView(this);
-        title.setText("PRoot GPUCodec Bridge");
+        title.setText("SELinux Hardware Bridge");
         title.setTextColor(TEXT_MAIN);
         title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);

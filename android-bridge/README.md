@@ -25,11 +25,16 @@ completely different identity — a real UID and SELinux domain assigned by
 Zygote/`installd` at install time — and normal apps use MediaCodec routinely
 with no special permission at all.
 
-**`android-bridge/` is that APK — "PRoot GPUCodec Bridge".** It's a minimal
-Android app whose only job is to expose real hardware `MediaCodec` (H.264
-encode and decode) over a loopback TCP socket, so the Debian/PRoot side can
-drive it directly. The name is deliberately literal: if you come back to
-this months later having forgotten why it's installed, "PRoot Codec
+**`android-bridge/` is that APK — "SELinux Hardware Bridge".** Today it's a
+minimal Android app whose only job is to expose real hardware `MediaCodec`
+(H.264 encode and decode) over a loopback TCP socket, so the Debian/PRoot
+side can drive it directly — but the name and protocol design are meant to
+generalize: any hardware the shell is SELinux-blocked from (camera capture
+is the next obvious candidate) fits the same "run a real app, forward it
+over a local socket" pattern, as an additional `mode=` on the same bridge
+rather than a new app. The name is deliberately literal about the *reason*
+this exists rather than today's one feature: if you come back to this
+months later having forgotten why it's installed, "SELinux Hardware
 Bridge" on the home screen (and the in-app subtitle, "Gives your
 Termux/PRoot shell hardware access it can't reach alone") should be enough
 to remind you.
@@ -95,23 +100,26 @@ network-fetched design tooling.
 
 ### Branding
 
-- **Name**: "PRoot GPUCodec Bridge" (package `com.gpucodec.bridge`,
-  unchanged, to avoid an unnecessary rename churn). Chosen to be
-  self-explanatory on the home screen/app switcher without needing the
-  README open: it names what it's a companion to (**PRoot**, i.e. this
-  repo's Termux/PRoot Debian container), which project family it belongs
-  to (**GPUCodec**, this repo's name/package), and its role (**Bridge**).
-  Plain "GPUCodec Bridge" (the original placeholder name) explained the
-  *what* but not the *why it's needed*, hence the "PRoot" prefix.
-- **Important clarification**: despite the "GPUCodec" name (kept for
-  project-family recognizability, matching this repo's name and the
-  app's own package `com.gpucodec.bridge`), this specific app does **not**
-  use the GPU. It reaches Qualcomm's dedicated hardware *video codec*
-  block (Codec2, `c2.qti.*`) — a separate fixed-function ASIC from the
-  Adreno GPU. AGC-1 (the rest of this repo, `agc.c`/`agc_core.h`) is the
-  part that actually runs on the GPU via OpenGL compute shaders. The two
-  are complementary, not the same mechanism — see the main README's
-  architecture overview if that distinction matters for your use case.
+- **Name**: "SELinux Hardware Bridge" (package `com.gpucodec.bridge`,
+  unchanged, to avoid an unnecessary rename churn). This reflects the
+  app's actual mechanism and intended scope, not just its current single
+  use case: the root cause it exists to work around is always the same
+  **SELinux domain restriction** on the Termux/PRoot shell (`untrusted_app_27`
+  is denied things a normal installed app's domain is allowed), and a
+  real installed APK is the fix regardless of *which* hardware is being
+  reached. Today that's the Codec2 hardware video codec (see below); the
+  same app/socket pattern is intended to be extended to other
+  SELinux-gated hardware a PRoot shell can't reach directly (e.g. camera
+  capture) as separate `mode=` request types on the same bridge, without
+  needing a new APK per hardware class.
+- **Important clarification**: this app does not itself use the GPU. Its
+  current (only, so far) capability reaches Qualcomm's dedicated hardware
+  *video codec* block (Codec2, `c2.qti.*`) — a separate fixed-function
+  ASIC from the Adreno GPU. AGC-1 (the rest of this repo, `agc.c`/
+  `agc_core.h`) is the part that actually runs on the GPU via OpenGL
+  compute shaders. The two are complementary, not the same mechanism —
+  see the main README's architecture overview if that distinction matters
+  for your use case.
 - **Icon**: a real launcher icon (adaptive icon, `res/mipmap-anydpi-v26/`),
   not the default Android placeholder. It reuses the same chip motif as
   the in-app header, with a terminal `>_` prompt glyph embedded in the
@@ -123,10 +131,10 @@ network-fetched design tooling.
   that was all that existed) — see its comments for the fix.
 - **Trademark note**: neither the name nor the icon references any
   trademarked product, chip vendor, or brand (no "Qualcomm", "Android"
-  logo, or similar) — "PRoot" here is used only in the plain descriptive
-  sense of the open-source `proot`/Termux tool this app is a companion to,
-  the same way this repo's own README and docs already use that term
-  throughout.
+  logo, or similar) — "SELinux" is a plain descriptive reference to the
+  Linux Security Modules framework (itself not a vendor trademark; NSA
+  open-sourced it in 2000), used the same way this repo's own docs already
+  refer to it throughout.
 
 ## Wire protocol (v2)
 
@@ -361,3 +369,13 @@ signing key.
   does. If the hardware-codec route is validated as reliable, an
   `agc1`-style `FFCodec` wrapper that shells out to `bridge_client`'s logic
   would be the natural next step.
+- **Only the video codec is wired up so far.** The app/protocol is named
+  and structured to generalize to other SELinux-blocked hardware (camera
+  capture being the most obvious next target — same DMA-BUF-style access
+  pattern, same "shell denied, real app allowed" root cause), but no
+  camera (or other) `mode=` has been implemented yet. Adding one means:
+  a new `mode=N` in the handshake, a matching branch in
+  `BridgeService.java` using the relevant Android API (`CameraX`/
+  `Camera2` for camera), and a corresponding `bridge_client` subcommand —
+  the loopback-socket plumbing and per-client threading already in place
+  would not need to change.
