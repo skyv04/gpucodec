@@ -368,14 +368,110 @@ useful thing to fork: it's standalone, buildable and sideloadable with
 `build.sh` alone, and doesn't depend on anyone else's release cadence or
 signing key.
 
+## Stress test results (verified on this device)
+
+Closing validation run against the installed `com.selinuxbridge.app` build.
+All numbers are 60 frames of `testsrc` unless noted, measured end-to-end
+from the Debian/PRoot side (`date`-delimited wall clock, bash `time` for
+CPU).
+
+### Throughput and scaling
+
+| Resolution | Encode | Decode | Output | Frames verified |
+|---|---|---|---|---|
+| 640x360 | 0.15 s (393 fps) | 0.17 s (356 fps) | 145 KB | 60/60 |
+| 1280x720 | 0.24 s (252 fps) | 0.27 s (220 fps) | 158 KB | 60/60 |
+| 1920x1080 | 0.41 s (147 fps) | 0.28 s (218 fps) | 187 KB | 60/60 |
+| 3840x2160 (30 fr) | 0.53 s (56 fps) | — | 353 KB | 30/30 |
+
+Every output was re-probed with `ffprobe -count_frames`: correct
+resolution, full frame count, no truncation. Decoded output runs 1.00–1.05x
+the tightly-packed size, i.e. stride/slice-height padding — the expected
+signature of genuine hardware output.
+
+**4K works fine.** An earlier note in this file warned that ~12.4 MB
+frames would need back-pressure before 4K was viable; measured, 4K encode
+completes in 0.53 s for 30 frames with no special handling. That warning
+was too cautious and has been corrected.
+
+### Cost comparison, 1080p x 60 frames
+
+| Path | Wall | CPU (user+sys) | Output | Notes |
+|---|---|---|---|---|
+| **Hardware bridge (Codec2)** | **0.47 s** | **0.12 s** | **187 KB** | inter-coded H.264 |
+| AGC-1 (Adreno GPU compute) | 0.99 s | 0.49 s | 7.9 MB | intra-only, own format |
+| x264 `veryfast` (CPU) | 1.06 s | 2.38 s | 291 KB | inter-coded H.264 |
+| x264 `medium` (CPU) | 2.05 s | — | 260 KB | inter-coded H.264 |
+
+The hardware path costs **~19x less local CPU than x264 `veryfast`** and
+**~4x less than AGC-1**. Caveat, stated plainly: the bridge's CPU figure
+counts only the *container* side. The real encode work happens inside the
+APK's own Android process, which this measurement cannot see (and which
+`/proc`-based sampling can't reach either, see the main README). The point
+is not that the work is free — it's that it leaves the PRoot container's
+CPU entirely, which is the whole reason to want it.
+
+AGC-1's much larger output is expected and not a defect: it is an
+**intra-only** codec (every frame coded independently, no motion
+compensation), so on a near-static synthetic clip H.264's inter-frame
+prediction wins enormously. That gap narrows sharply on
+high-motion/scene-cut content, and AGC-1 buys properties H.264 can't
+offer here (runs fully inside the container, no APK, no SELinux
+dependency, deterministic bit-exact round trip).
+
+### Does this help AGC-1? Measured, not assumed
+
+The two do **not** compete for the same silicon, and this was verified
+rather than argued: AGC-1 was timed at 1080p with the hardware codec idle,
+then again with the codec saturated by a 40-session background loop.
+
+| AGC-1 1080p | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Hardware codec **idle** | 0.940 s | 0.912 s | 0.986 s |
+| Hardware codec **saturated** | 0.939 s | 0.927 s | 0.929 s |
+
+**No measurable contention** — the saturated numbers actually land inside
+the idle run-to-run spread. So the honest framing is: the bridge does not
+give AGC-1 *better* GPU access (AGC-1 already has unrestricted GPU access
+via `/dev/kgsl-3d0`, and never needed help there). What it does is let
+H.264 work run on a completely separate fixed-function block, in parallel,
+leaving the GPU entirely free for AGC-1 or any other compute workload.
+That's a scheduling win, not an access win.
+
+### Robustness
+
+| Test | Result |
+|---|---|
+| 25 sequential 720p sessions | 25/25 passed, 0.17 s → 0.23 s, no leak or drift |
+| Client `SIGKILL`ed mid-stream | Service survived; `info` and a full encode both worked immediately after |
+| 2 concurrent sessions | pass |
+| 3 concurrent sessions | pass, 60/60 frames each |
+| **4 concurrent sessions** | **FAILS** — see gap table below |
+
+## Known gaps and potential fixes
+
+Everything below was either observed during the stress run above or is a
+known structural limitation. Severity is relative to the intended use
+(a personal hardware-offload bridge for a PRoot container), not to a
+hypothetical production service.
+
+| # | Gap | Evidence | Severity | Potential fix |
+|---|---|---|---|---|
+| 1 | **4+ concurrent sessions hang** | 3 concurrent passes cleanly; 4 reproducibly hangs, 2–3 jobs hitting a 45 s timeout and emitting truncated streams (59/60 frames, `bytestream -7` errors) | **High** | Qualcomm's Codec2 advertises a `max-concurrent-instances` limit; the service currently ignores it and blocks in `configure()`/`start()`. Fix: read that capability, keep a counting semaphore in `BridgeService`, and *reject* a session over the limit with a clear v2 error string (the protocol already carries one) rather than blocking forever. |
+| 2 | **Client hangs forever on a stalled server** | Same test — client had no timeout and sat until the external `timeout(1)` killed it | **High** | Add `SO_RCVTIMEO`/`SO_SNDTIMEO` to `bridge_client.c` (e.g. 30 s) and exit with a diagnostic instead of hanging. Pairs naturally with fix #1. |
+| 3 | **Transient first-run stall** | The very first sweep hung >120 s at 640x360, then the identical command ran in 0.15 s and never reproduced across ~80 later sessions | Medium | Most likely Android backgrounding/throttling the APK (it was off-screen). Mitigations: keep the app foregrounded, and implement #2 so a throttled app surfaces as a timeout rather than an indefinite hang. Worth re-testing deliberately with the screen off. |
+| 4 | **App must stay open** | Foreground service survives backgrounding but not force-stop/swipe-away; not a Linux daemon | Medium | Inherent to Android. Partial mitigations: `START_STICKY` (already set), battery-optimisation exemption, and a boot-completed receiver to auto-restart. Cannot be made fully headless without root. |
+| 5 | **`bridge.log` unreadable from Debian** | `find /sdcard/Android/data/com.selinuxbridge.app` → Permission denied (Android 11+ scoped storage) | Low | Already worked around by the `mode=2` `info` request over the socket. Could be closed fully by adding a `mode` that streams the log back over TCP. |
+| 6 | **Only H.264 / only the codec** | No HEVC/AV1 mode; no camera or other SELinux-gated hardware despite the app's name/scope | Low (roadmap) | The hardware exposes `c2.qti.hevc.*`, `c2.qti.vp9.*`, `c2.qti.av1.*` (confirmed in `info` output). Each is a new `mode=N` + a `MediaFormat` MIME change; camera would be a `Camera2`/`CameraX` branch. The socket/threading plumbing needs no change. |
+| 7 | **No `ffmpeg` integration** | AGC-1 ships an `FFCodec` (`ffmpeg/`); the bridge does not | Low | Wrap `bridge_client`'s protocol logic as an `agc1`-style `libavcodec` codec, so Shotcut/Blender could target the hardware encoder the same way they target AGC-1 today. |
+| 8 | **No back-pressure / unbounded buffering** | `bridge_client`'s writer thread streams as fast as the socket accepts; decode path reads the entire elementary stream into RAM | Low | Not observed to fail (4K/373 MB passed), but a long clip would balloon memory. Fix: bound the writer with a credit/window scheme, and stream-parse NALs instead of slurping the whole file. |
+| 9 | **Throwaway debug signing key** | `build.sh` generates `build/debug.keystore` on first run | Low | Fine for sideloading; would need a real, retained keystore before distributing builds anyone else installs (and a stable key is required for in-place updates). |
+
 ## What this does *not* solve
 
 - This still requires the app to be **open and on-screen** (a foreground
   service survives backgrounding but not a force-stop); it is not a daemon
   in the Linux sense.
-- 4K NV12 frames are ~12.4 MB each — do not send raw frames over the socket
-  at high framerate without back-pressure; this is a validation harness,
-  not a production streaming pipeline.
 - It does not (yet) wire into `ffmpeg` as an external codec the way AGC-1
   does. If the hardware-codec route is validated as reliable, an
   `agc1`-style `FFCodec` wrapper that shells out to `bridge_client`'s logic
