@@ -31,7 +31,7 @@ echo "[2/7] linking base APK + generating R.java"
   --manifest AndroidManifest.xml \
   -I "$PLATFORM_JAR" \
   --java build/gen \
-  build/res-compiled/values_strings.arsc.flat
+  build/res-compiled/*.flat
 
 echo "[3/7] compiling Java sources"
 javac --release 8 -d build/classes -classpath "$PLATFORM_JAR" \

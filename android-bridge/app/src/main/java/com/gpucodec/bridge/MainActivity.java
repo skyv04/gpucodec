@@ -102,13 +102,13 @@ public class MainActivity extends Activity {
         titles.setPadding(dp(16), 0, 0, 0);
 
         TextView title = new TextView(this);
-        title.setText("GPUCodec Bridge");
+        title.setText("PRoot Codec Bridge");
         title.setTextColor(TEXT_MAIN);
         title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Hardware H.264 bridge for Termux/PRoot");
+        subtitle.setText("Gives your Termux/PRoot shell hardware access it can't reach alone");
         subtitle.setTextColor(TEXT_DIM);
         subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
 

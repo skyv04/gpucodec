@@ -136,11 +136,11 @@ public class BridgeService extends Service {
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "GPUCodec Bridge", NotificationManager.IMPORTANCE_LOW);
+                    CHANNEL_ID, "PRoot Codec Bridge", NotificationManager.IMPORTANCE_LOW);
             nm.createNotificationChannel(ch);
         }
         return new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("GPUCodec Bridge")
+                .setContentTitle("PRoot Codec Bridge")
                 .setContentText("Hardware MediaCodec bridge on 127.0.0.1:" + PORT)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
                 .build();
@@ -196,7 +196,7 @@ public class BridgeService extends Service {
 
     private static String infoReport() {
         StringBuilder sb = new StringBuilder();
-        sb.append("GPUCodec Bridge diagnostics\n");
+        sb.append("PRoot Codec Bridge diagnostics\n");
         sb.append("device: ").append(Build.MODEL).append(" (" ).append(Build.HARDWARE).append(")\n");
         sb.append("android: ").append(Build.VERSION.RELEASE)
           .append(" (sdk ").append(Build.VERSION.SDK_INT).append(")\n\n");

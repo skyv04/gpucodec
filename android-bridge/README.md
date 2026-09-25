@@ -25,9 +25,14 @@ completely different identity — a real UID and SELinux domain assigned by
 Zygote/`installd` at install time — and normal apps use MediaCodec routinely
 with no special permission at all.
 
-**`android-bridge/` is that APK.** It's a minimal Android app whose only job
-is to expose real hardware `MediaCodec` (H.264 encode and decode) over a
-loopback TCP socket, so the Debian/PRoot side can drive it directly.
+**`android-bridge/` is that APK — "PRoot Codec Bridge".** It's a minimal
+Android app whose only job is to expose real hardware `MediaCodec` (H.264
+encode and decode) over a loopback TCP socket, so the Debian/PRoot side can
+drive it directly. The name is deliberately literal: if you come back to
+this months later having forgotten why it's installed, "PRoot Codec
+Bridge" on the home screen (and the in-app subtitle, "Gives your
+Termux/PRoot shell hardware access it can't reach alone") should be enough
+to remind you.
 
 ## What's here
 
@@ -85,8 +90,32 @@ The landing screen is a dark, gradient-themed dashboard rather than a blank
 white page: a chip-logo header, a pulsing green "listening" status card, a
 small data-flow diagram (`PRoot shell → Bridge :7878 → hardware codec`),
 and a short feature list. All of it is drawn with plain Java (canvas
-shapes, `GradientDrawable`) — no image assets or extra XML resources, so it
-doesn't touch `build.sh`'s resource-linking step at all.
+shapes, `GradientDrawable`) — no image assets, so it doesn't need any
+network-fetched design tooling.
+
+### Branding
+
+- **Name**: "PRoot Codec Bridge" (package `com.gpucodec.bridge`, unchanged,
+  to avoid an unnecessary rename churn). Chosen to be self-explanatory on
+  the home screen/app switcher without needing the README open: it names
+  both what it bridges *from* (a PRoot shell) and *to* (a hardware codec).
+  "GPUCodec Bridge" (the original placeholder name) explained the *what*
+  but not the *why it's needed*; this fixes that.
+- **Icon**: a real launcher icon (adaptive icon, `res/mipmap-anydpi-v26/`),
+  not the default Android placeholder. It reuses the same chip motif as
+  the in-app header, with a terminal `>_` prompt glyph embedded in the
+  chip's core — visually saying "a shell talking to a chip" in one glance.
+  Pure hand-written vector drawables (`res/drawable/ic_launcher_foreground.xml`,
+  `ic_launcher_background.xml`), no bitmap assets, no generated/downloaded
+  art. `build.sh`'s `aapt2 link` step was updated to pick up all compiled
+  resources (previously it only linked the one `strings.xml` file, since
+  that was all that existed) — see its comments for the fix.
+- **Trademark note**: neither the name nor the icon references any
+  trademarked product, chip vendor, or brand (no "Qualcomm", "Android"
+  logo, or similar) — "PRoot" here is used only in the plain descriptive
+  sense of the open-source `proot`/Termux tool this app is a companion to,
+  the same way this repo's own README and docs already use that term
+  throughout.
 
 ## Wire protocol (v2)
 
