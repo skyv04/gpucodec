@@ -362,16 +362,25 @@ public class BridgeService extends Service {
         int mode = androidBitrateMode(rcMode);
         String mime = fmt.getString(MediaFormat.KEY_MIME);
 
-        boolean supported = false;
+        /*
+         * Tri-state on purpose. "The component says no" and "the component
+         * would not tell us" are different situations: refusing the first is
+         * the whole point, but refusing the second would break encodes that
+         * work fine on devices where these capabilities are not reported.
+         */
+        Boolean supported = null;
         try {
             MediaCodecInfo.EncoderCapabilities ec = codec.getCodecInfo()
                     .getCapabilitiesForType(mime).getEncoderCapabilities();
-            supported = ec != null && ec.isBitrateModeSupported(mode);
+            if (ec != null) supported = ec.isBitrateModeSupported(mode);
         } catch (Exception e) {
             log("could not query encoder bitrate modes: " + e);
         }
 
-        if (!supported) {
+        if (supported == null) {
+            log("rate control: " + codec.getName() + " does not report its bitrate"
+                    + " modes; requesting " + rcName(rcMode) + " anyway");
+        } else if (!supported) {
             /*
              * Refuse rather than quietly encode in some other mode. Silently
              * substituting rate control is precisely how gap #14 hid for so

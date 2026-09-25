@@ -815,3 +815,11 @@ key is now stable (gap #9), so it installs as an in-place update.
   neither has an `mp4toannexb`-style filter to normalise input framing and
   VP9/AV1 hardware encode is not advertised on every device that advertises
   decode. `bridge_client` remains the way to reach them.
+
+- **VP9 and AV1 encode is software even here.** On the SM-F971U1 `info`
+  lists no `c2.qti.*` encoder for either — only `c2.android.vp9.encoder`
+  and `c2.android.av1.encoder`. They work, but they are CPU encoders, so
+  they buy none of the CPU saving that is the point of this bridge. Check
+  for the `[hardware]` marker in `info` before assuming otherwise. Decode
+  is a different story: `c2.qti.vp9.decoder` and `c2.qti.av1.decoder` are
+  both present and both hardware.
