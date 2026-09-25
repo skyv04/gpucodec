@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.gpucodec.bridge">
+    package="com.selinuxbridge.app">
 
     <!-- Without an explicit targetSdkVersion, aapt2 defaults to a very old
          API level, which trips Play Protect's "Unsafe app blocked: built

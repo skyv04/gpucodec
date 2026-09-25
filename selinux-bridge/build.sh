@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — rebuilds android-bridge/build/apk_final/gpucodec-bridge.apk
+# build.sh — rebuilds selinux-bridge/build/apk_final/selinux-bridge.apk
 # from source, using raw SDK command-line tools (no gradle network fetch).
 #
 # Requires an Android SDK with build-tools + a platforms/android-34 jar.
@@ -35,7 +35,7 @@ echo "[2/7] linking base APK + generating R.java"
 
 echo "[3/7] compiling Java sources"
 javac --release 8 -d build/classes -classpath "$PLATFORM_JAR" \
-  app/src/main/java/com/gpucodec/bridge/*.java build/gen/com/gpucodec/bridge/R.java
+  app/src/main/java/com/selinuxbridge/app/*.java build/gen/com/selinuxbridge/app/R.java
 
 echo "[4/7] dexing"
 java -cp "$BT_JAVA/lib/d8.jar" com.android.tools.r8.D8 \
@@ -56,10 +56,10 @@ fi
 java -cp "$BT_JAVA/lib/apksigner.jar" com.android.apksigner.ApkSignerTool sign \
   --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
   --ks-key-alias androiddebugkey \
-  --out build/apk_final/gpucodec-bridge.apk \
+  --out build/apk_final/selinux-bridge.apk \
   build/apk_unsigned/aligned.apk
 
 echo "[7/7] compiling loopback test client"
 gcc -O2 -Wall bridge_client.c -o bridge_client -lpthread
 
-echo "done: build/apk_final/gpucodec-bridge.apk and ./bridge_client"
+echo "done: build/apk_final/selinux-bridge.apk and ./bridge_client"

@@ -1,4 +1,4 @@
-package com.gpucodec.bridge;
+package com.selinuxbridge.app;
 
 import android.app.Activity;
 import android.content.Intent;

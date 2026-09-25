@@ -1,4 +1,4 @@
-package com.gpucodec.bridge;
+package com.selinuxbridge.app;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -42,7 +42,7 @@ import java.util.Locale;
  * Debian side over 127.0.0.1, where no cross-domain permission problem
  * exists (it's just a normal socket).
  *
- * Verified working end-to-end on this device (see android-bridge/README.md
+ * Verified working end-to-end on this device (see selinux-bridge/README.md
  * for the transcript): 30-frame encode -> valid H.264 -> decode -> 30
  * frames back, using c2.qti.* hardware codec components.
  *
@@ -78,9 +78,9 @@ import java.util.Locale;
  *   of installed AVC codecs) followed by the -1 EOS marker, then closes.
  */
 public class BridgeService extends Service {
-    private static final String TAG = "GPUCodecBridge";
+    private static final String TAG = "SELinuxBridge";
     private static final int PORT = 7878;
-    private static final String CHANNEL_ID = "gpucodec_bridge";
+    private static final String CHANNEL_ID = "selinux_bridge";
 
     private Thread serverThread;
     private volatile boolean running = true;

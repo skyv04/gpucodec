@@ -1,6 +1,6 @@
 /*
- * bridge_client.c — talks to the on-device GPUCodec Bridge APK
- * (android-bridge/) over loopback TCP to reach real Qualcomm hardware
+ * bridge_client.c — talks to the on-device SELinux Hardware Bridge APK
+ * (selinux-bridge/) over loopback TCP to reach real Qualcomm hardware
  * MediaCodec encode/decode from the Debian/PRoot side.
  *
  * This exists to answer, conclusively, whether a real installed APK
@@ -163,7 +163,7 @@ static int connect_bridge(void) {
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         fprintf(stderr,
             "connect to 127.0.0.1:7878 failed: %s\n"
-            "Is the GPUCodec Bridge app installed and open on-screen?\n"
+            "Is the SELinux Hardware Bridge app installed and open on-screen?\n"
             "(It must stay open/foregrounded; it does not run as a background daemon.)\n",
             strerror(errno));
         close(sock);

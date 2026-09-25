@@ -20,11 +20,11 @@ from that shell, no matter how the software is configured — see
 That restriction belongs to the **shell's own app identity**, though, not to
 the device. A real, installed Android app gets a different identity (a real
 UID and SELinux app domain from Zygote), and normal apps use MediaCodec with
-no special permission at all. **`android-bridge/`** is a small APK that
+no special permission at all. **`selinux-bridge/`** is a small APK that
 proves this: installed and running on this device, it exposes real hardware
 `MediaCodec` over a loopback socket, and a full encode→decode round trip
 (raw frames → real H.264 → decoded frames back) has been verified working
-from the Debian side against it — see `android-bridge/README.md` for the
+from the Debian side against it — see `selinux-bridge/README.md` for the
 verified transcript, wire protocol, and build instructions.
 
 The GPU, by contrast, *is* reachable: `/dev/kgsl-3d0` is world-readable and
@@ -568,7 +568,7 @@ works identically on a file and on stdin.
 | `cpu_sad.c` | CPU motion-search baseline used to decide against inter coding |
 | `agc_core.h` | the reusable, hardened GPU pipeline — see "Embedding AGC-1" |
 | `ffmpeg/` | `agc1`: AGC-1 as a real `libavcodec` codec for Shotcut/Blender |
-| `android-bridge/` | verified working: real hardware MediaCodec exposed over loopback from an installed APK, reachable from Debian/PRoot — full encode+decode round trip confirmed |
+| `selinux-bridge/` | verified working: real hardware MediaCodec exposed over loopback from an installed APK, reachable from Debian/PRoot — full encode+decode round trip confirmed |
 
 ## Notes for anyone extending this
 

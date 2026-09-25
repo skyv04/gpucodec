@@ -1,5 +1,5 @@
 #!/bin/sh
-# bridge-status -- quick health check for the GPUCodec Bridge companion APK.
+# bridge-status -- quick health check for the SELinux Hardware Bridge companion APK.
 #
 # Connects to the bridge's loopback socket and asks it for its `info`
 # diagnostic report (device model, Android version, and which AVC codecs
@@ -13,7 +13,7 @@ BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CLIENT="$BIN_DIR/bridge_client"
 
 if [ ! -x "$CLIENT" ]; then
-    echo "bridge-status: $CLIENT not found, run ./build.sh in android-bridge/ first" >&2
+    echo "bridge-status: $CLIENT not found, run ./build.sh in selinux-bridge/ first" >&2
     exit 2
 fi
 
@@ -21,7 +21,7 @@ if ! timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/7878' 2>/dev/null; then
     cat >&2 <<'EOF'
 bridge-status: cannot reach 127.0.0.1:7878
 
-The GPUCodec Bridge app is not running or not listening. This app must be
+The SELinux Hardware Bridge app is not running or not listening. This app must be
 open on-screen (or at least resident as a foreground service) -- it is not
 a background daemon that survives being swiped away. Open it from the app
 drawer, confirm its status line reads "Listening on 127.0.0.1:7878", then

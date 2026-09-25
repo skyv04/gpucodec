@@ -1,9 +1,9 @@
 #!/bin/sh
 # hw-transcode -- transcode an arbitrary video file through the real
-# Qualcomm hardware H.264 encoder, via the GPUCodec Bridge companion APK.
+# Qualcomm hardware H.264 encoder, via the SELinux Hardware Bridge companion APK.
 #
 # This exists because the Termux/PRoot shell itself can never reach Codec2
-# hardware directly (denied DMA-BUF access, see android-bridge/README.md);
+# hardware directly (denied DMA-BUF access, see selinux-bridge/README.md);
 # routing through a real installed app is the one confirmed way around
 # that. Unlike AGC-1 (this repo's own from-scratch GPU codec, used when you
 # want a self-contained non-standard format), this produces bog-standard
@@ -21,10 +21,10 @@ usage() {
 usage: hw-transcode <in> <out.mp4> [width height fps bitrate]
 
 Decodes <in> with ffmpeg, re-encodes the raw frames on-device through the
-real Qualcomm hardware encoder (via the GPUCodec Bridge app), and remuxes
+real Qualcomm hardware encoder (via the SELinux Hardware Bridge app), and remuxes
 the result to <out.mp4>.
 
-Requires the GPUCodec Bridge app (android-bridge/) to be installed and
+Requires the SELinux Hardware Bridge app (selinux-bridge/) to be installed and
 open on-screen. Run bridge-status first if unsure.
 EOF
     exit 2

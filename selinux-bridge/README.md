@@ -1,4 +1,4 @@
-# android-bridge: real hardware MediaCodec, reached from Debian/PRoot
+# selinux-bridge: real hardware MediaCodec, reached from Debian/PRoot
 
 ## Why this exists
 
@@ -25,7 +25,7 @@ completely different identity — a real UID and SELinux domain assigned by
 Zygote/`installd` at install time — and normal apps use MediaCodec routinely
 with no special permission at all.
 
-**`android-bridge/` is that APK — "SELinux Hardware Bridge".** Today it's a
+**`selinux-bridge/` is that APK — "SELinux Hardware Bridge".** Today it's a
 minimal Android app whose only job is to expose real hardware `MediaCodec`
 (H.264 encode and decode) over a loopback TCP socket, so the Debian/PRoot
 side can drive it directly — but the name and protocol design are meant to
@@ -61,7 +61,7 @@ Requires an Android SDK with build-tools and a `platforms/android-34`
 ./build.sh
 ```
 
-Produces `build/apk_final/gpucodec-bridge.apk` (signed with a throwaway debug
+Produces `build/apk_final/selinux-bridge.apk` (signed with a throwaway debug
 key generated on first run) and `./bridge_client`.
 
 **Non-obvious build detail**: this SDK ships build-tools in two flavors —
@@ -77,15 +77,26 @@ architecture mismatch entirely. Only `aapt2`/`zipalign` need the native
 ## Installing
 
 This machine has no running `adbd` (it would need to connect to itself), so
-sideload normally: the built APK is copied to `/sdcard/Download/gpucodec-bridge.apk`
+sideload normally: the built APK is copied to `/sdcard/Download/selinux-bridge.apk`
 by `build.sh`'s caller — open it with a file manager and allow install from
 this source, or enable *Settings → Developer options → Wireless debugging*,
 pair with `adb pair`, then:
 
 ```
 adb connect <phone-ip>:<port>
-adb install -r android-bridge/build/apk_final/gpucodec-bridge.apk
+adb install -r selinux-bridge/build/apk_final/selinux-bridge.apk
 ```
+
+**Migration note**: this project (directory, Java package, and APK
+filename) was renamed from `android-bridge`/`com.gpucodec.bridge`/
+`gpucodec-bridge.apk` to `selinux-bridge`/`com.selinuxbridge.app`/
+`selinux-bridge.apk` early on, while it was still safe to do a clean
+rename rather than carry a legacy package name forever. Because the
+Android package name changed, this installs as a **separate app**, not an
+update — Android has no way to know it's "the same app" under a new
+package ID. If you previously installed the old `com.gpucodec.bridge`
+build, uninstall it manually (it will keep running/showing up separately
+otherwise) after confirming the new one works.
 
 Launch the app once and leave it open (or in the recent-apps list — it runs
 as a foreground service with a persistent notification, so Android won't
@@ -100,7 +111,7 @@ network-fetched design tooling.
 
 ### Branding
 
-- **Name**: "SELinux Hardware Bridge" (package `com.gpucodec.bridge`,
+- **Name**: "SELinux Hardware Bridge" (package `com.selinuxbridge.app`,
   unchanged, to avoid an unnecessary rename churn). This reflects the
   app's actual mechanism and intended scope, not just its current single
   use case: the root cause it exists to work around is always the same
@@ -182,11 +193,11 @@ touching Android Studio.
 there was previously no way to see the app's internal state or errors from
 the Debian side. `BridgeService` now also writes a timestamped log to
 `getExternalFilesDir(null)/bridge.log` (typically
-`/sdcard/Android/data/com.gpucodec.bridge/files/bridge.log`), readable
+`/sdcard/Android/data/com.selinuxbridge.app/files/bridge.log`), readable
 directly from Debian:
 
 ```
-cat /sdcard/Android/data/com.gpucodec.bridge/files/bridge.log
+cat /sdcard/Android/data/com.selinuxbridge.app/files/bridge.log
 ```
 
 and the `info` mode / `tools/bridge-status` gives a live summary without
@@ -195,7 +206,7 @@ needing to read the log file at all for the common case.
 **Caveat, found while verifying this on-device**: on Android 11+ (this
 device is Android 17), `Android/data/<package>/` is scoped-storage-sandboxed
 and denies directory listing/reads from *other* apps/shells, including this
-one, even under `/sdcard` — `find /sdcard/Android/data/com.gpucodec.bridge`
+one, even under `/sdcard` — `find /sdcard/Android/data/com.selinuxbridge.app`
 returns "Permission denied" from the Debian side. So `bridge.log` exists
 and is useful if you have a way to read it (a root shell, `adb shell run-as`,
 or the device's own Files app with "show system files"), but it is **not**
@@ -235,7 +246,7 @@ needed to confirm it, unlike in the original v1 test below.
 
 ### Verified result (this device, this session, protocol v1)
 
-Installed via sideload (`/sdcard/Download/gpucodec-bridge.apk`, after fixing
+Installed via sideload (`/sdcard/Download/selinux-bridge.apk`, after fixing
 a Play Protect "unsafe app" block caused by a missing `targetSdkVersion` —
 see git history), launched, left open. From the Debian/PRoot side:
 
@@ -344,7 +355,7 @@ Two things make it impractical to pursue as a PR, though:
 1. **Termux:API must be signed with Termux's own release key** for its
    permission model to work at all (see its README) — a fork or PR from
    outside that org can't be self-installed as a drop-in the way this repo's
-   `android-bridge` APK can; it would need to actually be merged and shipped
+   `selinux-bridge` APK can; it would need to actually be merged and shipped
    in an official release before anyone could use it.
 2. **New-API PRs there don't appear to land quickly.** Checking the repo's
    recent closed PRs (as of this writing): a "feat: add calendar" addition
@@ -352,7 +363,7 @@ Two things make it impractical to pursue as a PR, though:
    vendor/product-ID feature PR was closed unmerged too. No issue or PR has
    ever mentioned MediaCodec or hardware video.
 
-So for anyone else in this situation, `android-bridge/` here is the more
+So for anyone else in this situation, `selinux-bridge/` here is the more
 useful thing to fork: it's standalone, buildable and sideloadable with
 `build.sh` alone, and doesn't depend on anyone else's release cadence or
 signing key.
