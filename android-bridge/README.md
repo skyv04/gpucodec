@@ -154,6 +154,30 @@ Zygote-forked app identity that unlocks the hardware codec the Termux/PRoot
 shell is denied. This is not inference — it is a directly observed,
 reproducible encode+decode round trip on this exact device.
 
+## Why this isn't a Termux:API contribution
+
+Termux:API's plugin architecture (`TermuxApiReceiver` dispatching to per-feature
+classes in `apis/`, streaming binary data over anonymous-socket file
+descriptors from `am broadcast`) is actually a good structural fit for this —
+a `MediaCodecAPI.java` following that same pattern would look natural there.
+Two things make it impractical to pursue as a PR, though:
+
+1. **Termux:API must be signed with Termux's own release key** for its
+   permission model to work at all (see its README) — a fork or PR from
+   outside that org can't be self-installed as a drop-in the way this repo's
+   `android-bridge` APK can; it would need to actually be merged and shipped
+   in an official release before anyone could use it.
+2. **New-API PRs there don't appear to land quickly.** Checking the repo's
+   recent closed PRs (as of this writing): a "feat: add calendar" addition
+   sat open for about three weeks and was closed unmerged; a USB
+   vendor/product-ID feature PR was closed unmerged too. No issue or PR has
+   ever mentioned MediaCodec or hardware video.
+
+So for anyone else in this situation, `android-bridge/` here is the more
+useful thing to fork: it's standalone, buildable and sideloadable with
+`build.sh` alone, and doesn't depend on anyone else's release cadence or
+signing key.
+
 ## What this does *not* solve
 
 - This still requires the app to be **open and on-screen** (a foreground
