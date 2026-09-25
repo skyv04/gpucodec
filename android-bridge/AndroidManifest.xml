@@ -2,6 +2,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.gpucodec.bridge">
 
+    <!-- Without an explicit targetSdkVersion, aapt2 defaults to a very old
+         API level, which trips Play Protect's "Unsafe app blocked: built
+         for an older version of Android" warning on install. Declaring a
+         current target here (matching the android-34 platform jar this is
+         built against) avoids that. -->
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.INTERNET" />
