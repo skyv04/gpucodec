@@ -64,6 +64,11 @@ public class MainActivity extends Activity {
 
         root.addView(buildHeader());
         root.addView(spacer(24));
+        View staleBanner = buildStaleBanner();
+        if (staleBanner != null) {
+            root.addView(staleBanner);
+            root.addView(spacer(14));
+        }
         root.addView(buildStatusCard());
         root.addView(spacer(14));
         root.addView(buildPowerCard());
@@ -196,6 +201,32 @@ public class MainActivity extends Activity {
         cardView.addView(powerAction);
         refreshPowerCard();
         return cardView;
+    }
+
+    /**
+     * An in-place update that fails to restart the service leaves this
+     * process running the previous build's code, which is otherwise
+     * completely silent -- the install succeeds, the bridge answers, and
+     * only the protocol version gives it away. Say so at the top of the
+     * screen, where it cannot be missed.
+     */
+    private View buildStaleBanner() {
+        String warning = BridgeService.staleProcessWarning(this);
+        if (warning == null) return null;
+
+        TextView tv = new TextView(this);
+        tv.setText("\u26A0  Restart needed\n\nA newer build is installed, but this process is "
+                 + "still running the previous one. Force-stop the app and reopen it "
+                 + "so the new code loads.");
+        tv.setTextColor(0xFFFFFFFF);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        int p = dp(16);
+        tv.setPadding(p, p, p, p);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xFF8A3A12);
+        bg.setCornerRadius(dp(14));
+        tv.setBackground(bg);
+        return tv;
     }
 
     private boolean isBatteryExempt() {

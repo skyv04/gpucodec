@@ -232,6 +232,31 @@ instead of being silently ignored — both confirmed on real hardware.
 Otherwise encode/decode will mis-frame — update both sides together. `bridge_client info` prints the
 server's protocol version, which is the quickest way to spot a mismatch.
 
+### Stale process after an update
+
+Installing a new build does **not** reliably restart the service. Android
+usually kills the process on replacement, but a foreground service can
+survive it, and `startForegroundService()` then only delivers another
+`onStartCommand()` to the classes already loaded — it never reloads code.
+The bridge keeps answering, on the old protocol, with nothing to show for
+it but a version number that does not change.
+
+`bridge_client info` reports both the protocol version and the **build
+timestamp of the code actually answering**, and flags the mismatch
+outright:
+
+```
+protocol: v5
+build: 2026-09-25 11:03:00
+STALE PROCESS: the package was replaced at 11:14:22, after this process started.
+  The update did not restart the service, so this is still the old
+  build. Force-stop the app and reopen it (or reboot).
+```
+
+The fix is to **force-stop the app and reopen it** — Settings → Apps →
+SELinux Hardware Bridge → Force stop. A reboot works too, and
+`BootReceiver` brings the service back on its own afterwards.
+
 ### Concurrency limit
 
 Codec2 caps how many codec instances can exist at once, and **blocks** in
@@ -698,6 +723,7 @@ deliberate Android platform behaviour that no unprivileged app can change.
 | 12 | **No tests, and the ones that mattered were untestable.** Everything was verified by hand against a live phone, so nothing could be checked before an install tap, and failure modes (a bridge that stalls, a bridge that is out of slots, a semi-planar chroma layout) could not be reproduced on demand at all. | Medium | ✅ fixed | `tools/selftest` runs 30 checks with no device attached — client round trips, exit codes, fault injection, flat-memory proof, both ffmpeg encoders **and both decoders**, protocol-v4 format records and mid-stream resolution changes, Annex-B parameter sets, timestamps — plus `tools/test-i420`'s 10 layout cases. `tools/mock-bridge.py` reproduces MediaCodec's awkward behaviour deliberately. |
 | 13 | **Decode could not be wired into libavcodec.** The protocol never carried the decoded picture size, so a libavcodec decoder had no way to size its frames or to notice a resolution change. Callers had to know the dimensions up front and pass them in. | Medium | ✅ fixed | Protocol v4 adds decode format records (`-2 w h`), taken from the output `Image`'s own crop rectangle so they are the display size rather than the macroblock-padded coded size. `bridge_client decode` no longer takes dimensions at all, and `h264_selinuxbridge`/`hevc_selinuxbridge` now exist as decoders. |
 | 14 | **Rate control was inaccurate.** `KEY_BITRATE_MODE` was never set, so Codec2 picked its own default -- VBR on this device's `c2.qti.*.encoder` components, where the requested bitrate is only an average the encoder may exceed freely. An explicit `-b:v` came back **+25% at 2 Mbps, +31% at 6 Mbps and +34% at 12 Mbps**, measured on ordinary content rather than a synthetic worst case. (Distinct from gap #11: that was zero timestamps making the encoder think the clip was instantaneous, which *under*-shot; this is the mode itself.) | Medium | ✅ fixed | Protocol v5 carries a rate-control mode in the **high byte of the codec field**, so the 24-byte header is unchanged and a v3/v4 client -- which sends a bare 0..3 -- lands on the new CBR default automatically. `bridge_client -r cbr\|vbr\|cq`, `hw-transcode -r`, and `ffmpeg -rc_mode cbr\|vbr\|cq`. CQ reinterprets the bitrate field as a quality in 1..100. An unsupported mode falls back to plain `KEY_BIT_RATE` rather than failing the session, and `info` now lists which modes each encoder advertises. |
+| 15 | **A stale process was invisible.** Android normally kills an app's process when its package is replaced, so the next start runs the new code. A long-lived foreground service makes surviving that much more likely, and nothing then reloads it: `BootReceiver`'s `MY_PACKAGE_REPLACED` handler calls `startForegroundService()`, but that only delivers another `onStartCommand()` to the **already loaded** classes. The bridge kept serving the old protocol while the user was looking at a successful install, with no symptom at all beyond a version number that never changed. Hit for real on the v4 → v5 update. | Medium | ✅ fixed | `info` now reports the **build timestamp of the code actually answering**, and the service compares the package's `lastUpdateTime` against the value this process saw at startup. `lastUpdateTime` moves only on replacement, so a difference means the package changed *while this process was already running* — exactly the stale case, with no timing heuristic to get wrong. The warning appears in `info`, in `bridge.log`, and as a banner at the top of the app. |
 
 ## Verification of the fixes
 
@@ -737,6 +763,8 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #14 rate | v5 client at its CBR default against a **v4** bridge, real hardware | encodes normally — the high byte is zero, so the header is wire-identical |
 | #14 rate | v5 client with `-r vbr` against a **v4** bridge, real hardware | rejected as `unknown codec id 256` — fails loudly rather than silently ignoring the mode |
 | #14 rate | `-r cbr/vbr/cq` packing, and that an old client defaults to cbr | mode survives the wire without disturbing the codec id |
+| #14 rate | The app's own log, real hardware, before the fix | MediaCodec replied `bitrate-mode=1` — `BITRATE_MODE_VBR`, the device confirming the diagnosis in its own words |
+| #15 stale | v4 → v5 in-place update, real device | reproduced: APK on disk reported v5, the running bridge still reported v4, and `info` showed none of the v5 markers |
 | #12 tests | `./tools/selftest` with no device attached | **30 passed, 0 failed** |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading

@@ -153,6 +153,8 @@ public class BridgeService extends Service {
         File dir = getExternalFilesDir(null);
         logFile = new File(dir != null ? dir : getFilesDir(), "bridge.log");
         log("service created, log file: " + logFile.getAbsolutePath());
+        String stale = staleProcessWarning(this);
+        if (stale != null) log(stale.replace('\n', ' '));
     }
 
     @Override
@@ -402,13 +404,65 @@ public class BridgeService extends Service {
         }
     }
 
-    private static String infoReport() {
+    /**
+     * Detects the case where this process is running code older than the APK
+     * currently installed on disk.
+     *
+     * Android usually kills an app's process when its package is replaced,
+     * so the next start picks up the new code. When the process survives --
+     * which a long-lived foreground service makes much more likely -- nothing
+     * reloads it: BootReceiver's MY_PACKAGE_REPLACED handler calls
+     * startForegroundService(), but that only delivers another
+     * onStartCommand() to the *already loaded* classes. The bridge then keeps
+     * serving the old protocol indefinitely while the user is looking at a
+     * successful install, with no symptom beyond a version number that never
+     * changes. Observed exactly once, on the v4 -> v5 update.
+     *
+     * The test is exact rather than a timing heuristic. The first code in
+     * this process to ask records the package's lastUpdateTime as it stood
+     * at startup; lastUpdateTime moves only when the package is replaced, so
+     * if it has moved since, the replacement happened *while this process was
+     * already running* -- which is precisely the stale case. Comparing a
+     * build timestamp against lastUpdateTime instead would have to guess how
+     * long a user takes to install an APK, and would cry wolf on every
+     * ordinary update.
+     */
+    private static long updateTimeAtStart = -1;
+
+    static synchronized String staleProcessWarning(android.content.Context ctx) {
+        try {
+            long now = ctx.getPackageManager()
+                    .getPackageInfo(ctx.getPackageName(), 0).lastUpdateTime;
+            if (updateTimeAtStart < 0) {
+                updateTimeAtStart = now;
+                return null;
+            }
+            if (now != updateTimeAtStart) {
+                return "STALE PROCESS: the package was replaced at "
+                        + new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date(now))
+                        + ", after this process started.\n"
+                        + "  The update did not restart the service, so this is still the old\n"
+                        + "  build. Force-stop the app and reopen it (or reboot).\n";
+            }
+        } catch (Exception e) {
+            /* Never let a diagnostic break the diagnostics. */
+        }
+        return null;
+    }
+
+    private String infoReport() {
         StringBuilder sb = new StringBuilder();
         sb.append("SELinux Hardware Bridge diagnostics\n");
         sb.append("device: ").append(Build.MODEL).append(" (" ).append(Build.HARDWARE).append(")\n");
         sb.append("android: ").append(Build.VERSION.RELEASE)
           .append(" (sdk ").append(Build.VERSION.SDK_INT).append(")\n");
         sb.append("protocol: v5\n");
+        // Names the build actually answering, which is the quickest way to
+        // tell an update that took effect from one that did not.
+        sb.append("build: ").append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                .format(new Date(BuildStamp.BUILD_TIME))).append("\n");
+        String stale = staleProcessWarning(this);
+        if (stale != null) sb.append(stale);
         sb.append("concurrent codec slots: ").append(CODEC_SLOT_LIMIT)
           .append(" (").append(CODEC_SLOTS.availablePermits()).append(" free)\n\n");
 
