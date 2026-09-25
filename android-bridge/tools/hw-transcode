@@ -1,0 +1,72 @@
+#!/bin/sh
+# hw-transcode -- transcode an arbitrary video file through the real
+# Qualcomm hardware H.264 encoder, via the GPUCodec Bridge companion APK.
+#
+# This exists because the Termux/PRoot shell itself can never reach Codec2
+# hardware directly (denied DMA-BUF access, see android-bridge/README.md);
+# routing through a real installed app is the one confirmed way around
+# that. Unlike AGC-1 (this repo's own from-scratch GPU codec, used when you
+# want a self-contained non-standard format), this produces bog-standard
+# H.264 that any player/tool can read -- the point here is hardware
+# offload, not a novel format.
+#
+# Usage:
+#   hw-transcode <in> <out.mp4> [width height fps bitrate]
+#
+# width/height/fps/bitrate default to the source's own, probed via ffprobe.
+set -eu
+
+usage() {
+    cat >&2 <<'EOF'
+usage: hw-transcode <in> <out.mp4> [width height fps bitrate]
+
+Decodes <in> with ffmpeg, re-encodes the raw frames on-device through the
+real Qualcomm hardware encoder (via the GPUCodec Bridge app), and remuxes
+the result to <out.mp4>.
+
+Requires the GPUCodec Bridge app (android-bridge/) to be installed and
+open on-screen. Run bridge-status first if unsure.
+EOF
+    exit 2
+}
+
+[ $# -ge 2 ] || usage
+case $1 in -h|--help) usage ;; esac
+
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CLIENT="$BIN_DIR/bridge_client"
+[ -x "$CLIENT" ] || { echo "hw-transcode: $CLIENT not found, run ./build.sh first" >&2; exit 2; }
+
+in=$1; out=$2
+[ -r "$in" ] || { echo "hw-transcode: $in: cannot read" >&2; exit 1; }
+
+width=${3:-}
+height=${4:-}
+fps=${5:-}
+bitrate=${6:-4000000}
+
+if [ -z "$width" ] || [ -z "$height" ]; then
+    dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+                    -of csv=p=0 "$in")
+    width=${width:-$(echo "$dims" | cut -d, -f1)}
+    height=${height:-$(echo "$dims" | cut -d, -f2)}
+fi
+if [ -z "$fps" ]; then
+    fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
+                   -of csv=p=0 "$in" | awk -F/ '{ if ($2==0) print 30; else printf "%d", $1/$2 }')
+fi
+
+if ! timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/7878' 2>/dev/null; then
+    echo "hw-transcode: bridge app unreachable, is it open? (see bridge-status)" >&2
+    exit 1
+fi
+
+tmp_h264=$(mktemp --suffix=.h264)
+trap 'rm -f "$tmp_h264"' EXIT
+
+echo "hw-transcode: ${width}x${height} @ ${fps}fps, bitrate=${bitrate} -> hardware encoder" >&2
+ffmpeg -v error -i "$in" -f rawvideo -pix_fmt yuv420p -s "${width}x${height}" -r "$fps" - \
+  | "$CLIENT" encode "$width" "$height" "$fps" "$bitrate" - "$tmp_h264"
+
+ffmpeg -v error -y -f h264 -r "$fps" -i "$tmp_h264" -c copy "$out"
+echo "hw-transcode: wrote $out" >&2

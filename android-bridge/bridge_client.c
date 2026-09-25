@@ -6,17 +6,21 @@
  * This exists to answer, conclusively, whether a real installed APK
  * (with a normal Android app UID/SELinux domain) can do what the
  * Termux/PRoot shell cannot: allocate DMA-BUF buffers for Codec2.
- * See README.md "Hardware codec bridge (experimental)" for full context.
+ * See README.md for full context and the verified test transcript.
  *
  * Usage:
  *   bridge_client encode <width> <height> <fps> <bitrate> <in.yuv420> <out.h264>
  *   bridge_client decode <width> <height> <in.h264> <out.yuv420>
+ *   bridge_client info
  *
- * Wire protocol matches BridgeService.java exactly (see that file for the
- * authoritative spec): big-endian ints, mode/width/height/fps/bitrate
- * handshake, then length-prefixed chunks each direction, -1 length = EOS.
+ * Wire protocol v2, matching BridgeService.java exactly (see that file for
+ * the authoritative spec): big-endian ints, mode/width/height/fps/bitrate
+ * handshake, then a status reply carrying either the selected codec name
+ * (success) or an error message (failure), then length-prefixed chunks
+ * each direction, -1 length = EOS.
  */
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -61,6 +65,17 @@ static int read_i32(int fd, int32_t *v) {
     return 0;
 }
 
+/* Reads a length-prefixed UTF-8 string reply (used for the codec-name /
+ * error-message field of the handshake, and for the `info` payload). */
+static char *read_lp_string(int fd) {
+    int32_t len;
+    if (read_i32(fd, &len) != 0 || len < 0) return NULL;
+    char *s = malloc((size_t)len + 1);
+    if (len > 0 && read_all(fd, s, (size_t)len) != 0) { free(s); return NULL; }
+    s[len] = '\0';
+    return s;
+}
+
 struct writer_args {
     int sock;
     int mode;
@@ -89,15 +104,20 @@ static void *writer_thread(void *arg) {
          * elementary stream as a single unit was tried first and produced
          * only a fraction of the expected output (observed: 110528 bytes
          * instead of the expected 2592000) -- this fixes that. */
-        fseek(a->fin, 0, SEEK_END);
-        long sz = ftell(a->fin);
-        fseek(a->fin, 0, SEEK_SET);
-        uint8_t *buf = malloc(sz);
-        fread(buf, 1, sz, a->fin);
+        /* Read the whole elementary stream into memory. Grown dynamically
+         * (rather than fseek+ftell to size it up front) so this also works
+         * when fin is a pipe (e.g. piped straight from ffmpeg), which isn't
+         * seekable. */
+        size_t cap = 1 << 20, sz = 0;
+        uint8_t *buf = malloc(cap);
+        size_t r;
+        while ((r = fread(buf + sz, 1, cap - sz, a->fin)) > 0) {
+            sz += r;
+            if (sz == cap) { cap *= 2; buf = realloc(buf, cap); }
+        }
 
         long i = 0;
         while (i < sz) {
-            /* find start of this NAL's payload (after its start code) */
             long start = i;
             long nal_begin;
             if (i + 4 <= sz && buf[i]==0 && buf[i+1]==0 && buf[i+2]==0 && buf[i+3]==1)
@@ -106,7 +126,6 @@ static void *writer_thread(void *arg) {
                 nal_begin = i + 3;
             else { i++; continue; }
 
-            /* find the next start code to bound this NAL's end */
             long j = nal_begin;
             long next = sz;
             while (j + 3 <= sz) {
@@ -129,19 +148,44 @@ static void *writer_thread(void *arg) {
     return NULL;
 }
 
+static int connect_bridge(void) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) { perror("socket"); return -1; }
+    int one = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(7878);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr,
+            "connect to 127.0.0.1:7878 failed: %s\n"
+            "Is the GPUCodec Bridge app installed and open on-screen?\n"
+            "(It must stay open/foregrounded; it does not run as a background daemon.)\n",
+            strerror(errno));
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
             "usage:\n"
             "  %s encode <w> <h> <fps> <bitrate> <in.yuv420> <out.h264>\n"
-            "  %s decode <w> <h> <in.h264> <out.yuv420>\n",
-            argv[0], argv[0]);
+            "  %s decode <w> <h> <in.h264> <out.yuv420>\n"
+            "  %s info\n",
+            argv[0], argv[0], argv[0]);
         return 2;
     }
 
     int mode;
-    int width, height, fps = 0, bitrate = 0;
-    const char *infile, *outfile;
+    int width = 0, height = 0, fps = 0, bitrate = 0;
+    const char *infile = NULL, *outfile = NULL;
 
     if (!strcmp(argv[1], "encode")) {
         if (argc != 8) { fprintf(stderr, "encode needs 6 args\n"); return 2; }
@@ -154,26 +198,15 @@ int main(int argc, char **argv) {
         mode = 1;
         width = atoi(argv[2]); height = atoi(argv[3]);
         infile = argv[4]; outfile = argv[5];
+    } else if (!strcmp(argv[1], "info")) {
+        mode = 2;
     } else {
         fprintf(stderr, "unknown mode '%s'\n", argv[1]);
         return 2;
     }
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) { perror("socket"); return 1; }
-    int one = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(7878);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        perror("connect (is the GPUCodec Bridge app open on-screen?)");
-        return 1;
-    }
+    int sock = connect_bridge();
+    if (sock < 0) return 1;
 
     write_i32(sock, mode);
     write_i32(sock, width);
@@ -182,14 +215,43 @@ int main(int argc, char **argv) {
     write_i32(sock, bitrate);
 
     int32_t status;
-    if (read_i32(sock, &status) != 0 || status != 0) {
-        fprintf(stderr, "server rejected handshake (status=%d)\n", status);
+    if (read_i32(sock, &status) != 0) {
+        fprintf(stderr, "lost connection during handshake\n");
         return 1;
     }
-    fprintf(stderr, "handshake ok, codec configured on-device\n");
+    char *reply = read_lp_string(sock);
+    if (status != 0) {
+        fprintf(stderr, "server rejected request: %s\n", reply ? reply : "(no message)");
+        free(reply);
+        close(sock);
+        return 1;
+    }
+    if (mode == 2) {
+        fprintf(stderr, "connected (bridge is alive)\n");
+    } else {
+        fprintf(stderr, "handshake ok, codec selected on-device: %s\n", reply ? reply : "?");
+    }
+    free(reply);
 
-    FILE *fin = fopen(infile, "rb");
-    FILE *fout = fopen(outfile, "wb");
+    if (mode == 2) {
+        int32_t olen;
+        for (;;) {
+            if (read_i32(sock, &olen) != 0) break;
+            if (olen < 0) break;
+            char *buf = malloc((size_t)olen + 1);
+            if (olen > 0) read_all(sock, buf, (size_t)olen);
+            buf[olen] = '\0';
+            fputs(buf, stdout);
+            free(buf);
+        }
+        close(sock);
+        return 0;
+    }
+
+    /* "-" means stdin/stdout, mirroring the agc-* tool conventions, so this
+     * can be piped straight from/to ffmpeg without touching a temp file. */
+    FILE *fin = !strcmp(infile, "-") ? stdin : fopen(infile, "rb");
+    FILE *fout = !strcmp(outfile, "-") ? stdout : fopen(outfile, "wb");
     if (!fin || !fout) { perror("fopen"); return 1; }
 
     struct writer_args wargs = { .sock = sock, .mode = mode,
@@ -211,7 +273,10 @@ int main(int argc, char **argv) {
     long got = 0;
     for (;;) {
         int32_t olen;
-        if (read_i32(sock, &olen) != 0) break;
+        if (read_i32(sock, &olen) != 0) {
+            fprintf(stderr, "connection dropped mid-stream (bridge app closed/killed?)\n");
+            break;
+        }
         if (olen < 0) break;
         if (olen > 0) {
             uint8_t *ob = malloc(olen);
