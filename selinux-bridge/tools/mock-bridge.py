@@ -276,8 +276,9 @@ def handle_camera(conn, w, h, fps, max_frames, cam_index):
         conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
         return
     if cam_index >= MOCK_CAMERAS:
-        msg = ("camera index %d out of range (have %d: 0=back, 1=front)"
-               % (cam_index, MOCK_CAMERAS)).encode()
+        msg = ("camera index %d out of range (this device has %d, so 0..%d;"
+               " 'bridge_client info' lists them)"
+               % (cam_index, MOCK_CAMERAS, MOCK_CAMERAS - 1)).encode()
         conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
         return
 

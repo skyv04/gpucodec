@@ -20,6 +20,7 @@ ROOT=$PWD
 PORT=${SELFTEST_PORT:-9413}
 STALL_PORT=$((PORT + 1))
 BUSY_PORT=$((PORT + 2))
+EMPTYCAP_PORT=$((PORT + 7))
 TMP=$(mktemp -d)
 FFMPEG=${FFMPEG:-$HOME/build/ffmpeg-agc1-install/bin/ffmpeg}
 FFPROBE=${FFPROBE:-$(dirname "$FFMPEG")/ffprobe}
@@ -87,8 +88,25 @@ while True:
     c.close()
 PY
 
+# A bridge that accepts a capture session and then dies without ever
+# announcing a format. This is the shape of the real bug found on hardware:
+# the server wrote its OK status before validating the request, so a bad
+# camera index produced an accepted session, an empty file and exit 0.
+cat >"$TMP/emptycap.py" <<'PY'
+import socket, struct, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(4)
+while True:
+    c, _ = s.accept()
+    name = b"camera:0"
+    c.recv(24)
+    c.sendall(struct.pack(">ii", 0, len(name)) + name)
+    c.close()
+PY
+
 python3 "$TMP/stall.py" "$STALL_PORT" >/dev/null 2>&1 & PIDS+=($!)
 python3 "$TMP/busy.py"  "$BUSY_PORT"  >/dev/null 2>&1 & PIDS+=($!)
+python3 "$TMP/emptycap.py" "$EMPTYCAP_PORT" >/dev/null 2>&1 & PIDS+=($!)
 sleep 2
 
 W=192; H=128; N=24
@@ -570,6 +588,18 @@ elif grep -qi "out of range" "$TMP/badcam.err"; then
     ok "an out-of-range camera index is refused by name"
 else
     bad "an out-of-range camera index failed without saying why"
+fi
+
+# The bug this guards against was found on real hardware: the bridge wrote
+# its OK status before checking the camera index, so the session was
+# accepted, produced nothing, and the client exited 0 on an empty file.
+if BRIDGE_PORT=$EMPTYCAP_PORT ./bridge_client camera -i 0 640 480 10 2 \
+        "$TMP/emptycap.y4m" >/dev/null 2>"$TMP/emptycap.err"; then
+    bad "a capture that produced nothing exited 0"
+elif grep -qi "produced nothing" "$TMP/emptycap.err"; then
+    ok "a capture that produced nothing fails instead of leaving an empty file"
+else
+    bad "a capture that produced nothing failed without saying why"
 fi
 
 # The selfie camera must be reachable, or the index is decorative.

@@ -483,6 +483,19 @@ static int run_capture_session(int sock, const struct session *s, FILE *fout) {
 
     if (fout != stdout) fclose(fout);
     else fflush(stdout);
+
+    /*
+     * A session that ended without ever announcing a format delivered
+     * nothing at all. The server refuses bad requests at the status line,
+     * so reaching here means the capture died after being accepted --
+     * say so, rather than exiting on a bare read error with an empty file
+     * and nothing to explain it.
+     */
+    if (!announced && rc != RC_TIMEOUT) {
+        fprintf(stderr, "capture produced nothing: the stream ended before the"
+                " format record (check the bridge's log with 'bridge_client log')\n");
+        rc = RC_ERR;
+    }
     fprintf(stderr, "%s: %ld unit(s), %ld byte(s)\n",
             is_video ? "camera" : "microphone", units, bytes);
     return rc;

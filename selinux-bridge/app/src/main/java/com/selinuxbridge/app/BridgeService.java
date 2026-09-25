@@ -870,10 +870,25 @@ public class BridgeService extends Service {
          * instances; a camera stream holds none, and making a webcam wait on
          * a transcode -- or vice versa -- would be a bug, not caution.
          */
+        CameraSource.Plan plan;
+        try {
+            plan = CameraSource.resolve(this, cameraIndex, width, height);
+        } catch (IOException e) {
+            /*
+             * Resolve before the status line, so a bad index or an
+             * unusable camera is refused with a message instead of
+             * becoming a stream that opens and then stops for no stated
+             * reason.
+             */
+            log("camera session refused: " + e.getMessage());
+            writeErrorStatus(out, e.getMessage());
+            return;
+        }
+
         startBridgeForeground();
         try {
             writeOkStatus(out, "camera:" + cameraIndex);
-            int sent = CameraSource.stream(this, cameraIndex, width, height, fps,
+            int sent = CameraSource.stream(this, plan, fps,
                     maxFrames, new CameraSource.FrameSink() {
                         @Override public void format(int w, int h) throws IOException {
                             out.writeInt(-2);
@@ -919,6 +934,13 @@ public class BridgeService extends Service {
             writeErrorStatus(out, "unknown audio source " + sourceId
                     + " (expected 0=mic, 1=voice_communication, 2=camcorder,"
                     + " 3=unprocessed)");
+            return;
+        }
+        try {
+            MicSource.check(sampleRate, channels, sourceId);
+        } catch (IOException e) {
+            log("microphone session refused: " + e.getMessage());
+            writeErrorStatus(out, e.getMessage());
             return;
         }
 

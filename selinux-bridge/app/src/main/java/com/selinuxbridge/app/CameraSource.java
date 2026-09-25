@@ -124,36 +124,63 @@ final class CameraSource {
     }
 
     /**
+     * A resolved camera: which HAL id, and at what size.
+     *
+     * This exists so that everything that can fail for a reason worth
+     * telling the caller about -- no cameras, an index out of range, no
+     * usable size -- happens *before* the session's status line is
+     * written. Once that line says OK there is nowhere left to report an
+     * error, and the client sees a stream that simply stops, which is the
+     * kind of silent failure this bridge is supposed to avoid.
+     */
+    static final class Plan {
+        final int index;
+        final String id;
+        final Size size;
+        Plan(int index, String id, Size size) { this.index = index; this.id = id; this.size = size; }
+        int width() { return size.getWidth(); }
+        int height() { return size.getHeight(); }
+    }
+
+    /** Picks the camera and size, or throws with a message worth showing a user. */
+    static Plan resolve(Context ctx, int cameraIndex, int reqW, int reqH) throws IOException {
+        CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+        if (cm == null) throw new IOException("no camera service");
+        try {
+            List<String> ids = orderedCameraIds(cm);
+            if (ids.isEmpty()) throw new IOException("device reports no cameras");
+            if (cameraIndex < 0 || cameraIndex >= ids.size()) {
+                throw new IOException("camera index " + cameraIndex + " out of range"
+                        + " (this device has " + ids.size() + ", so 0.." + (ids.size() - 1)
+                        + "; 'bridge_client info' lists them)");
+            }
+            String id = ids.get(cameraIndex);
+            Size size = chooseSize(supportedSizes(cm, id), reqW, reqH);
+            if (size == null) throw new IOException("camera " + id + " offers no YUV_420_888 size");
+            return new Plan(cameraIndex, id, size);
+        } catch (CameraAccessException e) {
+            throw new IOException("camera enumeration failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * Streams I420 frames into {@code sink} until {@code maxFrames} have been
      * sent, the sink throws (client hung up), or {@code stop} is signalled.
      *
      * @param maxFrames 0 means "until the client disconnects".
      * @return the number of frames actually delivered.
      */
-    static int stream(Context ctx, int cameraIndex, int reqW, int reqH, int fps,
+    static int stream(Context ctx, Plan plan, int fps,
                       int maxFrames, FrameSink sink, Logger logger) throws IOException {
 
         CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
         if (cm == null) throw new IOException("no camera service");
 
-        String id;
-        Size size;
-        try {
-            List<String> ids = orderedCameraIds(cm);
-            if (ids.isEmpty()) throw new IOException("device reports no cameras");
-            if (cameraIndex < 0 || cameraIndex >= ids.size()) {
-                throw new IOException("camera index " + cameraIndex + " out of range (have "
-                        + ids.size() + ": 0=back, 1=front)");
-            }
-            id = ids.get(cameraIndex);
-            size = chooseSize(supportedSizes(cm, id), reqW, reqH);
-            if (size == null) throw new IOException("camera " + id + " offers no YUV_420_888 size");
-        } catch (CameraAccessException e) {
-            throw new IOException("camera enumeration failed: " + e.getMessage(), e);
-        }
+        String id = plan.id;
+        Size size = plan.size;
 
-        logger.log("camera " + cameraIndex + " (hal id " + id + ", " + facingOf(cm, id)
-                + ") requested " + reqW + "x" + reqH + ", using " + size.getWidth()
+        logger.log("camera " + plan.index + " (hal id " + id + ", " + facingOf(cm, id)
+                + ") using " + size.getWidth()
                 + "x" + size.getHeight() + " @ " + fps + "fps");
 
         HandlerThread thread = new HandlerThread("bridge-camera");

@@ -68,6 +68,33 @@ final class MicSource {
      * @param maxSeconds 0 means "until the client disconnects".
      * @return bytes delivered.
      */
+    /**
+     * Cheap validation of a requested format, without opening anything.
+     *
+     * Called before the session's status line is written so that a format
+     * the device will not accept is refused with a message, rather than
+     * becoming a stream that opens and immediately stops.
+     */
+    static void check(int sampleRate, int channels, int sourceId) throws IOException {
+        if (sampleRate <= 0) sampleRate = DEFAULT_RATE;
+        if (channels <= 0) channels = 1;
+        if (channels != 1 && channels != 2) {
+            throw new IOException("channels must be 1 or 2, got " + channels);
+        }
+        if (androidSource(sourceId) < 0) {
+            throw new IOException("unknown audio source " + sourceId
+                    + " (expected 0=mic, 1=voice_communication, 2=camcorder, 3=unprocessed)");
+        }
+        int channelMask = channels == 2
+                ? AudioFormat.CHANNEL_IN_STEREO : AudioFormat.CHANNEL_IN_MONO;
+        int minBuf = AudioRecord.getMinBufferSize(
+                sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT);
+        if (minBuf == AudioRecord.ERROR || minBuf == AudioRecord.ERROR_BAD_VALUE) {
+            throw new IOException("device rejects " + sampleRate + "Hz x" + channels
+                    + " S16 capture");
+        }
+    }
+
     static long stream(int sampleRate, int channels, int sourceId, int maxSeconds,
                        AudioSink sink, Logger logger) throws IOException {
 
