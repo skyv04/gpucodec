@@ -1,0 +1,90 @@
+#!/bin/sh
+# agc-play -- play an AGC stream. Decoding happens on the GPU and the decoded
+# video never touches the disk.
+#
+# AGC has no muxing layer, so the player has to be told the geometry. It comes
+# from the stream itself via "agc probe", which prints shell variables exactly
+# so that wrappers never have to scrape human-readable output.
+#
+# Two things about this system shaped the pipeline below, both measured:
+#
+#   * ffplay cannot be used here. It asks X for a GLX context and termux-x11
+#     refuses (X_GLXCreateContext, BadValue), so nothing is displayed. It is
+#     kept as a last resort for machines where that is not true.
+#
+#   * Feeding VLC raw frames works but drops them: the rawvideo demuxer
+#     supplies no timestamps, so VLC starves its own picture pool and logs
+#     "buffer deadlock prevented". Wrapping the same bytes in Matroska first
+#     gives VLC a real timebase. Measured over an identical 14 s playback of
+#     the same clip: raw = 12 deadlocks, Matroska = 0. The wrap is not a
+#     re-encode -- "-c:v rawvideo" copies the pixels and only adds framing.
+set -eu
+
+usage() {
+    cat >&2 <<'EOF'
+usage: agc-play <file.agc> [extra player arguments...]
+
+Decodes on the GPU and streams the frames straight into a player.
+Note that VLC keeps its window open at the end of a clip; close it to return.
+EOF
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+case $1 in -h|--help) usage ;; esac
+f=$1; shift
+[ -r "$f" ] || { echo "agc-play: $f: cannot read" >&2; exit 1; }
+
+probe=$(agc probe "$f") || exit 1
+eval "$probe"
+
+fps=$AGC_FPS
+# A stream encoded without -r carries no rate. 30 is a reasonable guess, but
+# say so rather than silently inventing a timebase.
+case "$fps" in
+    0|0.000)
+        fps=30
+        echo "agc-play: stream carries no frame rate, assuming ${fps}" >&2 ;;
+esac
+size="${AGC_WIDTH}x${AGC_HEIGHT}"
+
+if command -v vlc >/dev/null 2>&1; then
+    # start-vlc-gpu moves VLC's scaling and colour conversion onto the Adreno
+    # and repairs the library ordering its GL output depends on. Its own
+    # diagnostics go to ~/.cache/vlc/gpu-launch.log.
+    if command -v start-vlc-gpu >/dev/null 2>&1; then
+        vlc_cmd=start-vlc-gpu
+    else
+        vlc_cmd=vlc
+    fi
+
+    if command -v ffmpeg >/dev/null 2>&1; then
+        agc decode "$f" - \
+          | ffmpeg -loglevel error -f rawvideo -pix_fmt "$AGC_FORMAT" \
+                -s "$size" -r "$fps" -i - -c:v rawvideo -f matroska - \
+          | "$vlc_cmd" --demux avformat --play-and-exit "$@" -
+    else
+        echo "agc-play: no ffmpeg, feeding VLC raw frames; expect dropped" >&2
+        echo "          frames ('buffer deadlock prevented')." >&2
+        chroma=I420
+        [ "$AGC_FORMAT" = gray8 ] && chroma=GREY
+        agc decode "$f" - | "$vlc_cmd" --demux rawvideo \
+            --rawvid-width "$AGC_WIDTH" --rawvid-height "$AGC_HEIGHT" \
+            --rawvid-chroma "$chroma" --rawvid-fps "$fps" \
+            --play-and-exit "$@" -
+    fi
+elif command -v mpv >/dev/null 2>&1; then
+    agc decode "$f" - | mpv --demuxer=rawvideo \
+        --demuxer-rawvideo-w="$AGC_WIDTH" --demuxer-rawvideo-h="$AGC_HEIGHT" \
+        --demuxer-rawvideo-mp-format="$AGC_FORMAT" \
+        --demuxer-rawvideo-fps="$fps" "$@" -
+elif command -v ffplay >/dev/null 2>&1; then
+    echo "agc-play: falling back to ffplay. If the window stays blank, this" >&2
+    echo "          display gives it no GLX context -- install vlc." >&2
+    agc decode "$f" - | ffplay -loglevel warning -autoexit \
+        -f rawvideo -pixel_format "$AGC_FORMAT" \
+        -video_size "$size" -framerate "$fps" -i - "$@"
+else
+    echo "agc-play: needs vlc, mpv or ffplay on PATH" >&2
+    exit 1
+fi

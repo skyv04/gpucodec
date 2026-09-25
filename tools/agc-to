@@ -1,0 +1,38 @@
+#!/bin/sh
+# agc-to -- convert an AGC stream into an ordinary video file.
+#
+# This is the escape hatch. Nothing except agc can read a .agc file, so
+# anything intended to leave this machine should go through here first.
+set -eu
+
+usage() {
+    cat >&2 <<'EOF'
+usage: agc-to <in.agc> <out.mp4> [extra ffmpeg arguments...]
+
+Extra arguments are passed to ffmpeg before the output, so the codec can be
+chosen explicitly, e.g.
+
+  agc-to clip.agc clip.mp4 -c:v libx264 -preset veryfast -crf 20
+EOF
+    exit 2
+}
+
+[ $# -ge 2 ] || usage
+case $1 in -h|--help) usage ;; esac
+in=$1; out=$2; shift 2
+[ -r "$in" ] || { echo "agc-to: $in: cannot read" >&2; exit 1; }
+
+probe=$(agc probe "$in") || exit 1
+eval "$probe"
+
+fps=$AGC_FPS
+case "$fps" in
+    0|0.000) fps=30
+             echo "agc-to: stream carries no frame rate, assuming ${fps}" >&2 ;;
+esac
+
+agc decode "$in" - \
+  | ffmpeg -v error -f rawvideo -pixel_format "$AGC_FORMAT" \
+           -video_size "${AGC_WIDTH}x${AGC_HEIGHT}" -framerate "$fps" \
+           -i - "$@" "$out" -y
+echo "agc-to: wrote $out" >&2

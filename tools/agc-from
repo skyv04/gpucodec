@@ -1,0 +1,44 @@
+#!/bin/sh
+# agc-from -- convert anything ffmpeg can read into an AGC stream.
+#
+# ffmpeg does the demuxing and decoding, agc does the compression on the GPU.
+# Frames move between them through a pipe, so the intermediate raw video --
+# which is enormous, about 3 MB per 1080p frame -- never reaches the disk.
+set -eu
+
+usage() {
+    cat >&2 <<'EOF'
+usage: agc-from <input-video> <out.agc> [quality 1..100]
+
+Note that AGC is intra-only: every frame is coded independently. Re-encoding
+an H.264 or HEVC file will produce a substantially larger one. This is for
+getting material into AGC, not for saving space.
+EOF
+    exit 2
+}
+
+[ $# -ge 2 ] || usage
+case $1 in -h|--help) usage ;; esac
+in=$1; out=$2; q=${3:-80}
+[ -r "$in" ] || { echo "agc-from: $in: cannot read" >&2; exit 1; }
+
+geom=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=width,height -of csv=p=0:s=x "$in") || {
+    echo "agc-from: $in: no video stream ffprobe can read" >&2; exit 1; }
+w=${geom%x*}; h=${geom#*x}
+[ -n "$w" ] && [ -n "$h" ] || { echo "agc-from: cannot determine size" >&2; exit 1; }
+
+rate=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=r_frame_rate -of csv=p=0 "$in" 2>/dev/null) || rate=""
+fps=$(echo "$rate" | awk -F/ '{ if (NF==2 && $2+0!=0) printf "%.3f", $1/$2;
+                                else if ($1+0>0) printf "%.3f", $1; else printf "0" }')
+case "$fps" in 0|0.000|"") fps=30 ;; esac
+
+# yuv420p subsamples chroma, so scale to even dimensions rather than letting
+# ffmpeg fail or silently round.
+w=$((w - w % 2)); h=$((h - h % 2))
+size="${w}x${h}"
+
+echo "agc-from: $in -> $out  ${size} @ ${fps} fps  q$q" >&2
+ffmpeg -v error -i "$in" -vf "scale=${w}:${h}" -pix_fmt yuv420p -f rawvideo - \
+  | agc encode - "$out" -s "$size" -f yuv420p -q "$q" -r "$fps"

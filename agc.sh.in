@@ -1,0 +1,24 @@
+#!/bin/sh
+# AGC-1 launcher.
+#
+# The codec needs the side-by-side Turnip/Zink Mesa stack rather than the
+# stale system driver, and a headless EGL device since it never opens a
+# window. Setting that up here means `agc` works from any directory and from
+# scripts, instead of only from a shell that happens to have sourced
+# activate.sh first.
+#
+# Generated from agc.sh.in by `make install`.
+
+if [ -f "@MESA@/activate.sh" ]; then
+    . "@MESA@/activate.sh"
+else
+    echo "agc: @MESA@/activate.sh is missing; the GPU stack is not installed" >&2
+    exit 1
+fi
+
+# Honour an explicit EGL_PLATFORM (for example when rendering to a display),
+# but default to surfaceless because this is a batch tool.
+EGL_PLATFORM="${EGL_PLATFORM:-surfaceless}"
+export EGL_PLATFORM
+
+exec "@LIBEXEC@" "$@"

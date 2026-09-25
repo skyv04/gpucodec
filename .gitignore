@@ -1,0 +1,13 @@
+# compiled binaries
+agc
+bench
+cpu_sad
+
+# raw test frames - 8 MB each, regenerate from a source clip with:
+#   ffmpeg -i clip.mp4 -vframes 1 -f rawvideo -pix_fmt gray frame4k.gray
+*.gray
+*.yuv
+*.raw
+
+# encoded output
+*.agc

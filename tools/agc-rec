@@ -1,0 +1,53 @@
+#!/bin/sh
+# agc-rec -- record the X11 display straight into an AGC stream.
+#
+# This is the case where the offload is worth the most: screen capture runs
+# for minutes, and a CPU encoder competes with the very applications being
+# recorded. Capture and colour conversion stay on the CPU; the compression,
+# which is the expensive part, moves to the GPU.
+set -eu
+
+usage() {
+    cat >&2 <<'EOF'
+usage: agc-rec <out.agc> [-s WxH] [-r fps] [-q 1..100] [-d display]
+
+Defaults: full screen, 30 fps, quality 80, $DISPLAY.
+Stop with Ctrl-C; the stream stays playable because every frame is
+self-contained.
+EOF
+    exit 2
+}
+
+out=""; size=""; fps=30; q=80; disp=${DISPLAY:-:0}
+while [ $# -gt 0 ]; do
+    case $1 in
+        -s) [ $# -ge 2 ] || usage; size=$2; shift 2 ;;
+        -r) [ $# -ge 2 ] || usage; fps=$2; shift 2 ;;
+        -q) [ $# -ge 2 ] || usage; q=$2; shift 2 ;;
+        -d) [ $# -ge 2 ] || usage; disp=$2; shift 2 ;;
+        -h|--help) usage ;;
+        -*) echo "agc-rec: unknown option $1" >&2; exit 2 ;;
+        *)  [ -z "$out" ] || { echo "agc-rec: unexpected argument $1" >&2; exit 2; }
+            out=$1; shift ;;
+    esac
+done
+[ -n "$out" ] || usage
+
+if [ -z "$size" ]; then
+    size=$(xdpyinfo -display "$disp" 2>/dev/null | awk '/dimensions:/{print $2; exit}') || true
+    [ -n "$size" ] || {
+        echo "agc-rec: cannot determine the size of $disp, pass -s WxH" >&2; exit 1; }
+fi
+
+# yuv420p subsamples chroma, so both dimensions must be even.
+w=${size%x*}; h=${size#*x}
+case "$w$h" in *[!0-9]*) echo "agc-rec: bad size '$size'" >&2; exit 2 ;; esac
+w=$((w - w % 2)); h=$((h - h % 2))
+size="${w}x${h}"
+
+echo "agc-rec: recording $disp at $size, ${fps} fps, quality $q -> $out" >&2
+echo "agc-rec: press Ctrl-C to stop" >&2
+
+ffmpeg -loglevel error -f x11grab -framerate "$fps" -video_size "$size" -i "$disp" \
+       -pix_fmt yuv420p -f rawvideo - \
+  | agc encode - "$out" -s "$size" -f yuv420p -q "$q" -r "$fps"
