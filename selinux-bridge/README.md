@@ -418,6 +418,13 @@ because `getUserMedia({audio:true})` takes the *default* source, and the
 default here is otherwise a silent monitor. A working virtual microphone
 that nothing is routed to is indistinguishable from a broken one.
 
+For a call, consider `bridge-mic -s voice`, which selects
+`VOICE_COMMUNICATION` and so gets the platform echo canceller and noise
+suppressor. Be aware that it will look *much* quieter on an idle room —
+measured here at **−72.7 dBFS** against `mic`'s −34.0 — because
+suppressing steady ambient noise is exactly what it is for. That is the
+feature working, not a broken source; speech still comes through.
+
 One constraint worth knowing if you move the FIFO: PulseAudio runs in
 **Termux**, not in this container, so the path must exist identically on
 both sides. `/data/data/com.termux/files/home` does; `/tmp` does not, and
@@ -887,10 +894,15 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #6 camera | On-demand behaviour, **real device** | no bridge session at all while idle; camera opened the instant a reader attached, `reader gone, camera released` when it left |
 | #6 mic | `bridge_client mic 48000 1 3`, **real device** | exactly **288,000 B** = 3.000 s of 48 kHz mono S16, in 3.15 s wall; rms 497 |
 | #6 mic | `bridge-mic` → PulseAudio → `parec`, **real device** | rms 567, **−35.2 dBFS** — real room ambience, matching the −34.6 dBFS of the direct capture |
+| #6 mic | All four audio sources, 2 s each, **real device** | each exactly **192,000 B**, and measurably different: `mic` −34.0, `camcorder` −32.0, `unprocessed` −42.0, `voice` **−72.7** dBFS. The 39 dB gap on `voice` is the platform noise suppressor gating steady room noise, i.e. the source selection really does reach the hardware |
 | #6+#7 | **Phone camera → phone hardware H.264 encoder → mp4**, driven from Debian, two concurrent bridge sessions | 150 frames of 720p in **5.75 s**, 3.2 MB, `nb_frames=150`, decodes clean and the image survives intact |
 | #17 browser | Chromium `getUserMedia({audio:true})` against the **real phone mic** | non-zero RMS across all 8 samples (`0.0482 … 0.0051`) — a web app really does get live phone audio |
 | #18 order | `camera -i 9` on **real hardware**, before the fix | `handshake ok`, 0 units, 0 bytes, **exit 0** — the bug, reproduced |
+| #18 order | Same command on **real hardware**, after the fix | refused at the status line: `camera index 9 out of range (this device has 4, so 0..3; 'bridge_client info' lists them)`, **exit 1** |
+| #18 order | `mic 48000 5` (an impossible channel count), **real hardware** | refused: `channels must be 1 or 2, got 5`, **exit 1** |
+| #18 order | Capture regression check on the same build | camera 20 frames byte-exact, mic 192,000 B = 2.00 s — refusing bad requests did not break good ones |
 | #18 order | Stand-in bridge that accepts a capture session then dies | client reports `capture produced nothing` and exits nonzero instead of leaving an empty file |
+| #6+#7 | **Phone camera → phone hardware HEVC encoder → mp4**, new build | 120 frames of 720p in **4.87 s**, 1.5 MB, `codec_name=hevc nb_frames=120` |
 | #6 camera | `bridge-webcam` + `ffmpeg` reading the FIFO, 20 frames of 640x480 | exactly **9,216,000 B** (20 × 640 × 480 × 1.5) and **18 distinct** per-frame luma means — live, changing content rather than a repeated frame |
 | #6 camera | Bridge sessions counted while nothing was reading the FIFO | **no session at all** for 3 s of idling, then exactly one the instant a reader attached — the camera is opened on demand, not held open |
 | #6 camera | Reader detaches mid-stream | `reader gone, camera released`, writer re-armed for the next reader, no orphan left behind |
