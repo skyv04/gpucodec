@@ -56,6 +56,13 @@ final class CameraSource {
     private static final long OPEN_TIMEOUT_MS = 5000;
     /** Frames buffered between the camera callback and the socket writer. */
     private static final int QUEUE_DEPTH = 3;
+
+    /** Rotation directives, as carried in bits 8-15 of the request's codec field. */
+    static final int ROTATE_AUTO = 0;
+    static final int ROTATE_NONE = 1;
+    static final int ROTATE_90 = 2;
+    static final int ROTATE_180 = 3;
+    static final int ROTATE_270 = 4;
     /** Sentinel queued when capture has finished. */
     private static final byte[] END = new byte[0];
 
@@ -137,13 +144,53 @@ final class CameraSource {
         final int index;
         final String id;
         final Size size;
-        Plan(int index, String id, Size size) { this.index = index; this.id = id; this.size = size; }
-        int width() { return size.getWidth(); }
-        int height() { return size.getHeight(); }
+        final int rotation;
+        Plan(int index, String id, Size size, int rotation) {
+            this.index = index; this.id = id; this.size = size; this.rotation = rotation;
+        }
+        /** Picture size as delivered to the client, i.e. after rotation. */
+        int width() { return quarter() ? size.getHeight() : size.getWidth(); }
+        int height() { return quarter() ? size.getWidth() : size.getHeight(); }
+        private boolean quarter() { return rotation == 90 || rotation == 270; }
     }
 
-    /** Picks the camera and size, or throws with a message worth showing a user. */
-    static Plan resolve(Context ctx, int cameraIndex, int reqW, int reqH) throws IOException {
+    /**
+     * Turns the rotation directive carried in the request into degrees.
+     *
+     * 0 means "auto", which is what every existing client sends and what
+     * anyone actually wants: use the sensor's mounting angle so the picture
+     * comes out upright. The explicit values exist because a tripod, a
+     * desk stand or a downstream filter can each make the automatic answer
+     * the wrong one, and because "give me exactly what the sensor saw" has
+     * to stay reachable for debugging.
+     */
+    static int rotationDegrees(CameraManager cm, String id, int directive) throws IOException {
+        switch (directive) {
+            case ROTATE_AUTO: return sensorOrientation(cm, id);
+            case ROTATE_NONE: return 0;
+            case ROTATE_90: return 90;
+            case ROTATE_180: return 180;
+            case ROTATE_270: return 270;
+            default:
+                throw new IOException("rotation directive " + directive + " is not one of"
+                        + " 0=auto 1=none 2=90 3=180 4=270");
+        }
+    }
+
+    /** The sensor's mounting angle, or 0 if the device will not say. */
+    static int sensorOrientation(CameraManager cm, String id) {
+        try {
+            Integer o = cm.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.SENSOR_ORIENTATION);
+            return o == null ? 0 : ((o % 360) + 360) % 360;
+        } catch (CameraAccessException e) {
+            return 0;
+        }
+    }
+
+    /** Picks the camera, size and rotation, or throws with a message worth showing a user. */
+    static Plan resolve(Context ctx, int cameraIndex, int reqW, int reqH, int rotateDirective)
+            throws IOException {
         CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
         if (cm == null) throw new IOException("no camera service");
         try {
@@ -155,9 +202,19 @@ final class CameraSource {
                         + "; 'bridge_client info' lists them)");
             }
             String id = ids.get(cameraIndex);
+            int rotation = rotationDegrees(cm, id, rotateDirective);
+            /*
+             * The hint selects the *sensor* size, not the delivered one.
+             * Un-rotating it first would be the tidier-looking choice and is
+             * wrong: sensors only advertise landscape sizes, so a quarter
+             * turn always yields a portrait picture, and asking for the
+             * nearest thing to 720x1280 just picks a worse sensor mode for
+             * the same portrait result. Ask for 1280x720 from a sideways
+             * sensor and you get that many pixels, announced as 720x1280.
+             */
             Size size = chooseSize(supportedSizes(cm, id), reqW, reqH);
             if (size == null) throw new IOException("camera " + id + " offers no YUV_420_888 size");
-            return new Plan(cameraIndex, id, size);
+            return new Plan(cameraIndex, id, size, rotation);
         } catch (CameraAccessException e) {
             throw new IOException("camera enumeration failed: " + e.getMessage(), e);
         }
@@ -181,7 +238,10 @@ final class CameraSource {
 
         logger.log("camera " + plan.index + " (hal id " + id + ", " + facingOf(cm, id)
                 + ") using " + size.getWidth()
-                + "x" + size.getHeight() + " @ " + fps + "fps");
+                + "x" + size.getHeight() + " @ " + fps + "fps"
+                + (plan.rotation == 0 ? " (sensor is upright)"
+                   : ", rotated " + plan.rotation + " deg to "
+                     + plan.width() + "x" + plan.height()));
 
         HandlerThread thread = new HandlerThread("bridge-camera");
         thread.start();
@@ -291,7 +351,7 @@ final class CameraSource {
             }
 
             // Announce the size we actually got before any pixels.
-            sink.format(size.getWidth(), size.getHeight());
+            sink.format(plan.width(), plan.height());
 
             while (maxFrames == 0 || delivered < maxFrames) {
                 byte[] frame;
@@ -307,7 +367,13 @@ final class CameraSource {
                             + OPEN_TIMEOUT_MS + "ms");
                 }
                 if (frame == END) break;
-                sink.frame(frame);
+                /*
+                 * Rotated here, on the sending thread, rather than in the
+                 * ImageReader callback: that callback runs on the HAL's
+                 * handler, and a transpose there would hold up the next
+                 * frame's delivery. Here it overlaps with the client's read.
+                 */
+                sink.frame(I420.rotate(frame, size.getWidth(), size.getHeight(), plan.rotation));
                 delivered++;
             }
         } finally {

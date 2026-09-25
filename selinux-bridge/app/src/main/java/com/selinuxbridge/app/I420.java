@@ -102,4 +102,66 @@ final class I420 {
         readPlane(p[2], crop.left / 2, crop.top / 2, cw, ch, out, w * h + cw * ch);
         return out;
     }
+
+    /**
+     * Rotates a tightly packed I420 frame by 0/90/180/270 degrees clockwise.
+     *
+     * Camera sensors are mounted at whatever angle suited the industrial
+     * design, so raw frames come out sideways on most phones; this is what
+     * puts them upright. The rotated frame is exactly the same number of
+     * bytes, because a quarter turn only swaps the dimensions -- a w x h
+     * frame with w/2 x h/2 chroma becomes h x w with h/2 x w/2 chroma.
+     *
+     * The quarter turns are a transpose, which is the cache-hostile case:
+     * consecutive source bytes land a whole output row apart. Walking in
+     * tiles keeps both the source row and the destination column slice in
+     * cache and is several times faster than the naive loop, which matters
+     * because this runs on every frame of a live capture.
+     *
+     * Requires even dimensions, which every camera size is; an odd one is
+     * returned unchanged rather than corrupted.
+     */
+    static byte[] rotate(byte[] src, int w, int h, int degrees) {
+        degrees = ((degrees % 360) + 360) % 360;
+        if (degrees == 0 || (w & 1) != 0 || (h & 1) != 0) return src;
+        if (degrees != 90 && degrees != 180 && degrees != 270) return src;
+        int cw = w / 2, ch = h / 2;
+        int uOff = w * h, vOff = uOff + cw * ch;
+        byte[] dst = new byte[src.length];
+        rotatePlane(src, 0, w, h, dst, 0, degrees);
+        rotatePlane(src, uOff, cw, ch, dst, uOff, degrees);
+        rotatePlane(src, vOff, cw, ch, dst, vOff, degrees);
+        return dst;
+    }
+
+    /** One plane of {@link #rotate}; output is h x w for the quarter turns. */
+    private static void rotatePlane(byte[] src, int so, int w, int h,
+                                    byte[] dst, int dof, int degrees) {
+        final int B = 32;
+        if (degrees == 180) {
+            for (int y = 0; y < h; y++) {
+                int si = so + y * w;
+                int di = dof + (h - 1 - y) * w + (w - 1);
+                for (int x = 0; x < w; x++) dst[di - x] = src[si + x];
+            }
+            return;
+        }
+        for (int y0 = 0; y0 < h; y0 += B) {
+            int ym = Math.min(y0 + B, h);
+            for (int x0 = 0; x0 < w; x0 += B) {
+                int xm = Math.min(x0 + B, w);
+                for (int y = y0; y < ym; y++) {
+                    int si = so + y * w;
+                    if (degrees == 90) {
+                        // (x, y) -> (h - 1 - y, x) in an h-wide output
+                        int db = dof + (h - 1 - y);
+                        for (int x = x0; x < xm; x++) dst[db + x * h] = src[si + x];
+                    } else {
+                        // 270: (x, y) -> (y, w - 1 - x)
+                        for (int x = x0; x < xm; x++) dst[dof + (w - 1 - x) * h + y] = src[si + x];
+                    }
+                }
+            }
+        }
+    }
 }

@@ -1,0 +1,355 @@
+<!doctype html>
+<html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>SELinux Hardware Bridge -- live capture test</title>
+<style>
+ body{background:#12141a;color:#e8eaf0;font:15px/1.5 system-ui,sans-serif;margin:0;padding:14px}
+ h1{font-size:19px;margin:0 0 2px}
+ .sub{color:#9aa3b2;font-size:13px;margin-bottom:14px}
+ .card{background:#1b1e26;border:1px solid #2a2f3a;border-radius:10px;padding:12px;margin-bottom:12px}
+ .card h2{font-size:15px;margin:0 0 8px;display:flex;align-items:center;gap:8px}
+ video{width:100%;max-width:520px;background:#000;border-radius:6px;display:block}
+ .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px}
+ button{background:#2d6cdf;color:#fff;border:0;border-radius:7px;padding:9px 14px;font-size:14px;cursor:pointer}
+ button.alt{background:#39404f}
+ button:disabled{opacity:.5}
+ .k{color:#9aa3b2}
+ .v{font-family:ui-monospace,monospace}
+ .big{font-size:17px;font-weight:600}
+ .meter{height:16px;background:#0e1016;border-radius:8px;overflow:hidden;max-width:520px}
+ .meter>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#2ecc71,#f1c40f,#e74c3c);transition:width .08s}
+ .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}
+ .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+ table{border-collapse:collapse;width:100%;max-width:520px;font-size:13px}
+ td{padding:3px 0;vertical-align:top}
+ td:first-child{color:#9aa3b2;width:46%}
+ .verdict{margin-top:10px;padding:10px;border-radius:8px;font-size:13px;background:#0e1016;border:1px solid #2a2f3a}
+</style></head><body>
+
+<h1>SELinux Hardware Bridge &mdash; live capture test</h1>
+<div class=sub>Everything on this page is driven by the phone's own hardware, reached from Debian over loopback.</div>
+
+<div class=card>
+  <h2><span class="dot" id=vdot style="background:#555"></span> 1. Camera in the browser</h2>
+  <video id=v autoplay muted playsinline></video>
+  <div class=row>
+    <button id=start>Start camera</button>
+    <button id=reopen class=alt disabled>Re-open camera</button>
+  </div>
+  <table>
+    <tr><td>picture is</td><td class="v big" id=lag>&mdash;</td></tr>
+    <tr><td>clock in the picture</td><td class="v big">read it in the video &uarr;</td></tr>
+    <tr><td>real time now</td><td class="v big" id=now>&mdash;</td></tr>
+    <tr><td>picture signature</td><td class=v id=sig>&mdash;</td></tr>
+    <tr><td>frames repeated</td><td class="v big" id=changed>&mdash;</td></tr>
+    <tr><td>opened at</td><td class=v id=opened>&mdash;</td></tr>
+    <tr><td>feed file on disk</td><td class=v id=feed>&mdash;</td></tr>
+  </table>
+  <div class=verdict id=verdict>
+    Press <b>Start camera</b>. Every frame has the time it was captured burned
+    into its top-left corner &mdash; compare that with <b>real time now</b>.
+    <br><br>
+    Chromium plays this file from its first byte and never seeks, so the
+    picture starts as far behind the present as the file was long when the
+    camera opened, and that offset never closes. The page now truncates the
+    feed before opening, which is what keeps <b>picture is</b> near zero
+    instead of minutes. Press <b>Re-open camera</b> to reset it again and
+    watch the number drop back.
+  </div>
+</div>
+
+<div class=card>
+  <h2><span class="dot" id=adot style="background:#555"></span> 2. Microphone in the browser</h2>
+  <div class=row><button id=astart>Start microphone</button></div>
+  <div class=meter><i id=bar></i></div>
+  <table>
+    <tr><td>level</td><td class="v big" id=lvl>&mdash;</td></tr>
+    <tr><td>peak held</td><td class=v id=peak>&mdash;</td></tr>
+    <tr><td>device</td><td class=v id=alabel>&mdash;</td></tr>
+  </table>
+  <div class=verdict><b>This meter is Chromium's synthetic test tone, not your
+  phone.</b> The switch that lets this page inject the phone camera
+  (<code>--use-fake-device-for-media-stream</code>) replaces the microphone at
+  the same time &mdash; one switch, both devices. A tab can have the real
+  camera or the real microphone, never both. For genuinely live phone audio,
+  run <code>bridge-mic</code> and open a browser without that switch; the level
+  below then follows the room.</div>
+</div>
+
+<div class=card>
+  <h2><span class="dot" id=rdot style="background:#555"></span> 3. Record a clip (A/V sync test)</h2>
+  <div class=row>
+    <button id=rec disabled>Record 10 s</button>
+    <span class=v id=rstate>start the camera and the microphone first</span>
+  </div>
+  <table>
+    <tr><td>state</td><td class="v big" id=rbig>&mdash;</td></tr>
+    <tr><td>saved to</td><td class=v id=rfile>&mdash;</td></tr>
+  </table>
+  <div class=verdict><b>Clap once, sharply, about two seconds in.</b> The clip
+  captures the phone camera and the phone microphone through the same
+  <code>MediaRecorder</code>, so both land on one timeline. The clap is visible
+  (hands meeting) and audible (a transient) in the same file, and the distance
+  between those two marks is the audio/video skew &mdash; measured without
+  needing any outside reference.</div>
+</div>
+
+<div class=card>
+  <h2>4. Is this page actually live?</h2>
+  <table>
+    <tr><td>clock</td><td class="v big" id=clock>&mdash;</td></tr>
+    <tr><td>page repaints</td><td class=v id=ticks>0</td></tr>
+  </table>
+  <div class=verdict>Proof that a frozen picture is not a frozen page. If the
+  clock is ticking and the meter is moving, the only thing standing still is the
+  video.</div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let stream=null, firstSig=null, sigChanges=0, ticks=0;
+let lastFeed=null, lastDb=null, audioLabel=null;
+let seen=new Set(), repeats=0;
+let feedFps=15, openFrames=0, lag=null;
+let micStream=null;
+
+function recReady(){
+  const ok = !!(stream && micStream);
+  $('rec').disabled = !ok;
+  if(ok) $('rstate').textContent = "ready";
+}
+
+function fmtBytes(n){
+  if(n<1024) return n+" B";
+  if(n<1048576) return (n/1024).toFixed(0)+" KB";
+  if(n<1073741824) return (n/1048576).toFixed(1)+" MB";
+  return (n/1073741824).toFixed(2)+" GB";
+}
+
+setInterval(()=>{
+  ticks++;
+  const t=new Date().toLocaleTimeString();
+  $('clock').textContent=t;
+  $('now').textContent=t;
+  $('ticks').textContent=ticks;
+},1000);
+
+setInterval(async()=>{
+  try{
+    const r=await fetch('/feed'); const j=await r.json();
+    lastFeed=j; feedFps=j.fps||feedFps;
+    $('feed').textContent=fmtBytes(j.bytes)+"  ("+j.frames+" frames written)";
+    /*
+     * How far behind the present the picture is, in seconds: the recording
+     * holds j.frames/fps seconds of footage, and currentTime says how far
+     * into it the browser has got. Whatever is left is lag. This is the
+     * number the whole demo exists to show.
+     */
+    const v=$('v');
+    if(stream && v.currentTime>0){
+      lag=(j.frames-openFrames)/feedFps - v.currentTime;
+      $('lag').textContent=lag.toFixed(1)+" s behind";
+      $('lag').className="v big "+(lag>2?"bad":(lag<1?"ok":""));
+    }
+  }catch(e){ $('feed').textContent="(server gone)"; }
+},1000);
+
+const cv=document.createElement('canvas'), cx=cv.getContext('2d',{willReadFrequently:true});
+function signature(){
+  const v=$('v');
+  if(!v.videoWidth) return null;
+  cv.width=64; cv.height=36;
+  cx.drawImage(v,0,0,64,36);
+  const d=cx.getImageData(0,0,64,36).data;
+  let h=2166136261;
+  for(let i=0;i<d.length;i+=4){ h^=d[i]; h=Math.imul(h,16777619); }
+  return (h>>>0).toString(16).padStart(8,'0');
+}
+
+setInterval(()=>{
+  if(!stream) return;
+  const s=signature();
+  if(!s) return;
+  $('sig').textContent=s;
+  if(firstSig===null){ firstSig=s; }
+  else if(s!==firstSig){ sigChanges++; }
+  /*
+   * Repeats are the decisive measurement, not changes. Chromium plays the
+   * file it mapped at open and starts it again at the end, so the picture
+   * moves and looks live -- but a real camera never hands you the same
+   * frame twice, and a 64x36 hash colliding by accident is not a thing.
+   * One repeat proves this is a recording.
+   */
+  if(seen.has(s)) repeats++; else seen.add(s);
+  const looped=repeats>0;
+  $('changed').textContent = looped
+      ? (repeats+" \u2014 this is a recording on loop")
+      : (seen.size+" distinct so far");
+  $('changed').className = "v big "+(looped?"bad":"");
+  $('vdot').style.background = looped ? "#f87171" : "#facc15";
+},500);
+
+async function openCam(){
+  if(stream){ stream.getVideoTracks().forEach(t=>t.stop()); }
+  firstSig=null; sigChanges=0; seen=new Set(); repeats=0;
+  $('sig').textContent="...";$('changed').textContent="...";
+  $('start').disabled=true; $('reopen').disabled=true;
+  try{
+    /*
+     * Restart the feed before opening, not after. Chromium plays this file
+     * from its first byte, so whatever is already in it is pure latency --
+     * open against a two-hour file and the picture is two hours behind.
+     * Truncating first is the difference between a live-looking webcam and
+     * a very slow replay.
+     */
+    $('lag').textContent="restarting the feed...";
+    const r=await (await fetch('/restart')).json();
+    feedFps=r.fps||feedFps;
+    openFrames=r.frames||0;
+    stream=await navigator.mediaDevices.getUserMedia({video:true});
+    $('v').srcObject=stream;
+    $('opened').textContent=new Date().toLocaleTimeString();
+    $('reopen').disabled=false;
+    $('start').textContent="Restart camera";
+    recReady();
+  }catch(e){
+    $('sig').textContent="failed";
+    $('changed').textContent=e.name+": "+e.message;
+    $('changed').className="v big bad";
+  }finally{
+    $('start').disabled=false;
+  }
+}
+$('start').onclick=openCam;
+$('reopen').onclick=openCam;
+
+$('astart').onclick=async()=>{
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({audio:true});
+    micStream=s; recReady();
+    audioLabel=s.getAudioTracks()[0].label||"(default)";
+    $('alabel').textContent=audioLabel;
+    const ac=new AudioContext(); const src=ac.createMediaStreamSource(s);
+    const an=ac.createAnalyser(); an.fftSize=1024; src.connect(an);
+    const buf=new Float32Array(an.fftSize); let peak=0;
+    $('adot').style.background="#4ade80";
+    setInterval(()=>{
+      an.getFloatTimeDomainData(buf);
+      let sum=0; for(const x of buf) sum+=x*x;
+      const rms=Math.sqrt(sum/buf.length);
+      const db=20*Math.log10(Math.max(rms,1e-6));
+      lastDb=db;
+      const pct=Math.max(0,Math.min(100,(db+60)/60*100));
+      $('bar').style.width=pct+"%";
+      $('lvl').textContent=db.toFixed(1)+" dBFS";
+      if(rms>peak){peak=rms;$('peak').textContent=(20*Math.log10(peak)).toFixed(1)+" dBFS";}
+    },80);
+  }catch(e){
+    audioLabel=e.name+": "+e.message;
+    $('alabel').textContent=audioLabel;
+    $('alabel').className="v bad";
+  }
+};
+
+// Record both tracks through one MediaRecorder. Two separate recorders
+// would each stamp their own timeline and the skew measurement would be
+// meaningless; one recorder means the browser muxes them against a single
+// clock, which is exactly the alignment a video call would get.
+async function record(seconds){
+  const mix=new MediaStream();
+  stream.getVideoTracks().forEach(t=>mix.addTrack(t));
+  micStream.getAudioTracks().forEach(t=>mix.addTrack(t));
+  let mime="video/webm;codecs=vp8,opus";
+  if(!MediaRecorder.isTypeSupported(mime)) mime="video/webm";
+  const mr=new MediaRecorder(mix,{mimeType:mime});
+  const chunks=[];
+  mr.ondataavailable=e=>{ if(e.data&&e.data.size) chunks.push(e.data); };
+  const done=new Promise(res=>{ mr.onstop=res; });
+  $('rdot').style.background="#f87171";
+  $('rec').disabled=true;
+  mr.start();
+  const t0=Date.now();
+  for(let i=seconds;i>0;i--){
+    $('rbig').textContent="recording... "+i+"s  (CLAP NOW)";
+    await new Promise(r=>setTimeout(r,1000));
+  }
+  mr.stop(); await done;
+  const blob=new Blob(chunks,{type:mime});
+  $('rbig').textContent="uploading "+fmtBytes(blob.size)+"...";
+  try{
+    const r=await fetch('/upload',{method:'POST',body:blob});
+    const j=await r.json();
+    $('rfile').textContent=j.path;
+    $('rbig').textContent="saved "+fmtBytes(blob.size)+" ("+
+        ((Date.now()-t0)/1000).toFixed(1)+"s wall)";
+  }catch(e){
+    $('rbig').textContent="upload failed: "+e.message;
+    $('rbig').className="v big bad";
+  }
+  $('rdot').style.background="#4ade80";
+  $('rec').disabled=false;
+  return blob.size;
+}
+$('rec').onclick=()=>record(10);
+
+// ?auto=SECONDS drives the page without a human and posts what it saw back
+// to the server, so the demo can be checked in a headless browser -- the
+// same code path a person exercises by clicking.
+const AUTO=new URLSearchParams(location.search).get('auto');
+// ?start=1 opens the camera on load, for a screenshot or a kiosk.
+if(new URLSearchParams(location.search).get('start')) openCam();
+// ?record=SECONDS opens camera + mic and records a clip unattended, so the
+// A/V skew can be measured without a person clicking three buttons in order.
+const REC=new URLSearchParams(location.search).get('record');
+if(REC){
+  (async()=>{
+    await openCam();
+    $('astart').click();
+    for(let i=0;i<40 && !micStream;i++) await new Promise(r=>setTimeout(r,250));
+    if(!micStream){ $('rbig').textContent="no microphone"; return; }
+    await new Promise(r=>setTimeout(r,1000));
+    await record(parseInt(REC,10)||10);
+  })();
+}
+if(AUTO){
+  const say=async o=>{
+    // A GET beacon rather than a POST: it survives whatever the headless
+    // browser decides about request bodies, and the server needs no extra
+    // verb to receive it.
+    try{ await fetch('/report?j='+encodeURIComponent(JSON.stringify(o))); }catch(e){}
+  };
+  (async()=>{
+    try{
+      const startFeed=await (await fetch('/feed')).json();
+      /*
+       * Deliberately not awaited: getUserMedia can hang indefinitely when
+       * there is no audio server to answer it, and a self-check that hangs
+       * reports nothing at all, which is the least useful outcome. Kick
+       * both off, wait the wall-clock budget, then report what happened --
+       * which is also exactly what a person does.
+       */
+      openCam();
+      $('astart').onclick();
+      await new Promise(r=>setTimeout(r,parseFloat(AUTO)*1000));
+      await say({
+        videoOpened: !!stream && stream.getVideoTracks().length>0,
+        videoLabel: stream&&stream.getVideoTracks()[0] ? stream.getVideoTracks()[0].label : null,
+        videoSize: $('v').videoWidth+"x"+$('v').videoHeight,
+        signature: $('sig').textContent,
+        signatureChanges: sigChanges,
+        distinctFrames: seen.size,
+        repeatedFrames: repeats,
+        feedFramesStart: startFeed?startFeed.frames:null,
+        feedFramesEnd: lastFeed?lastFeed.frames:null,
+        pageTicks: ticks,
+        lagSeconds: lag===null?null:Number(lag.toFixed(2)),
+        videoCurrentTime: Number($('v').currentTime.toFixed(2)),
+        audioLabel: audioLabel,
+        audioDb: lastDb
+      });
+    }catch(e){
+      await say({error: (e && e.name ? e.name+": "+e.message : String(e))});
+    }
+  })();
+}
+</script>
+</body></html>

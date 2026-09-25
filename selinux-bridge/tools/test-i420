@@ -174,8 +174,79 @@ public class Test {
         if (out.length == expect) ok("crop rectangle drives the output size");
         else bad("crop ignored (" + out.length + " != " + expect + ")");
 
+        rotationTests();
+
         System.out.println("\n  " + pass + " passed, " + fail + " failed");
         System.exit(fail == 0 ? 0 : 1);
+    }
+
+    /* Rotation is where a transpose bug hides: the frame stays the right
+     * length whichever way the indices are wrong, so length checks prove
+     * nothing. These place known values at known corners instead. */
+    static void rotationTests() throws Exception {
+        Method rot = m("rotate", byte[].class, int.class, int.class, int.class);
+
+        int w = 8, h = 4, cw = 4, ch = 2;
+        byte[] src = new byte[w * h + 2 * cw * ch];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) src[y * w + x] = (byte) (y * w + x);
+        for (int i = 0; i < cw * ch; i++) {
+            src[w * h + i] = (byte) (100 + i);
+            src[w * h + cw * ch + i] = (byte) (200 + i);
+        }
+
+        byte[] r90 = (byte[]) rot.invoke(null, src, w, h, 90);
+        // 90 clockwise: source (0,0) -- the top-left -- lands top-right.
+        boolean ok90 = r90.length == src.length
+                && r90[0 * h + (h - 1)] == src[0]                       // (0,0) -> (h-1, 0)
+                && r90[(w - 1) * h + (h - 1)] == src[w - 1]             // (w-1,0) -> (h-1,w-1)
+                && r90[0] == src[(h - 1) * w];                          // (0,h-1) -> (0,0)
+        if (ok90) ok("rotate 90 moves corners the right way");
+        else bad("rotate 90 corners wrong");
+
+        // Chroma must rotate with luma, into its own plane.
+        boolean chromaOk = r90[w * h + 0] == src[w * h + (ch - 1) * cw]
+                && r90[w * h + cw * ch] == src[w * h + cw * ch + (ch - 1) * cw];
+        if (chromaOk) ok("rotate 90 carries U and V with the luma");
+        else bad("rotate 90 chroma wrong");
+
+        byte[] r180 = (byte[]) rot.invoke(null, src, w, h, 180);
+        if (r180[0] == src[src.length - 1 - 2 * cw * ch] && r180[w * h - 1] == src[0])
+            ok("rotate 180 reverses each plane");
+        else bad("rotate 180 wrong");
+
+        // Four quarter turns must land exactly where they started.
+        byte[] big = source(64, 48);
+        byte[] cur = big;
+        int cw2 = 64, ch2 = 48;
+        for (int i = 0; i < 4; i++) {
+            cur = (byte[]) rot.invoke(null, cur, cw2, ch2, 90);
+            int t = cw2; cw2 = ch2; ch2 = t;
+        }
+        if (java.util.Arrays.equals(big, cur)) ok("four 90-degree turns are the identity");
+        else bad("four 90-degree turns are not the identity");
+
+        // 270 must undo 90 rather than being a second 90.
+        byte[] back = (byte[]) rot.invoke(null,
+                (byte[]) rot.invoke(null, big, 64, 48, 90), 48, 64, 270);
+        if (java.util.Arrays.equals(big, back)) ok("270 undoes 90");
+        else bad("270 does not undo 90");
+
+        // The tile loop must not drop or duplicate anything at a tile edge:
+        // 100x70 is not a multiple of the 32-byte block.
+        byte[] odd = source(100, 70);
+        byte[] there = (byte[]) rot.invoke(null, odd, 100, 70, 90);
+        byte[] andBack = (byte[]) rot.invoke(null, there, 70, 100, 270);
+        if (java.util.Arrays.equals(odd, andBack)) ok("sizes that straddle the tile edge survive");
+        else bad("tile-edge handling is wrong at 100x70");
+
+        // 0 and an odd size are pass-throughs, not corruption.
+        if (rot.invoke(null, src, w, h, 0) == src) ok("rotate 0 returns the frame untouched");
+        else bad("rotate 0 copied or changed the frame");
+        byte[] oddDim = source(65, 33);
+        if (rot.invoke(null, oddDim, 65, 33, 90) == oddDim)
+            ok("odd dimensions are refused rather than corrupted");
+        else bad("odd dimensions were rotated anyway");
     }
 }
 JAVA

@@ -139,6 +139,20 @@ import java.util.concurrent.TimeUnit;
  *       codec bits 0-7  camera index in the bridge's own ordering, which is
  *                       back cameras first then front: 0 = rear, 1 = selfie.
  *                       Raw HAL ids are not stable enough to expose.
+ *       codec bits 8-15 rotation: 0 = auto, 1 = none, 2 = 90, 3 = 180,
+ *                       4 = 270, clockwise. Auto uses the sensor's mounting
+ *                       angle, which is what makes the picture upright;
+ *                       phone sensors are almost never mounted the way the
+ *                       screen is, so raw frames arrive on their side. This
+ *                       reuses spare bits of an existing field, so it is
+ *                       still v6 on the wire -- and because the old clients
+ *                       all sent zero, they get the upright behaviour for
+ *                       free. A quarter turn swaps the picture dimensions,
+ *                       and the format record reports the rotated size, so
+ *                       a client that reads it (as it must) needs no change.
+ *                       The size hint still selects the *sensor* mode, so
+ *                       a quarter turn returns that many pixels with the
+ *                       dimensions swapped.
  *       Output is a format record followed by tightly packed I420 frames,
  *       then the -1 EOS marker. Frames are *dropped* rather than queued if
  *       the client reads slowly, because latency matters more than
@@ -614,7 +628,9 @@ public class BridgeService extends Service {
                 for (int i = 0; i < ids.size(); i++) {
                     String id = ids.get(i);
                     sb.append("  camera ").append(i).append(" [hal id ").append(id)
-                      .append(", ").append(CameraSource.facingOf(cm, id)).append("]");
+                      .append(", ").append(CameraSource.facingOf(cm, id))
+                      .append(", sensor ").append(CameraSource.sensorOrientation(cm, id))
+                      .append("deg]");
                     Size[] sizes = CameraSource.supportedSizes(cm, id);
                     if (sizes.length == 0) {
                         sb.append(" (no YUV_420_888 sizes)");
@@ -726,7 +742,12 @@ public class BridgeService extends Service {
             }
 
             if (mode == 4) {
-                handleCamera(out, width, height, fps, bitrate, codecId);
+                /*
+                 * Bits 8-15 are the rate-control mode for an encode, and the
+                 * rotation directive for a capture -- the header is fixed, so
+                 * modes reuse fields rather than growing it.
+                 */
+                handleCamera(out, width, height, fps, bitrate, codecId, rcMode);
                 return;
             }
 
@@ -846,7 +867,8 @@ public class BridgeService extends Service {
     }
 
     private void handleCamera(DataOutputStream out, int width, int height,
-                              int fps, int maxFrames, int cameraIndex) throws IOException {
+                              int fps, int maxFrames, int cameraIndex,
+                              int rotateDirective) throws IOException {
         if (!granted(Manifest.permission.CAMERA)) {
             log("camera session refused: CAMERA not granted");
             writeErrorStatus(out, "the bridge app has not been granted CAMERA."
@@ -872,7 +894,7 @@ public class BridgeService extends Service {
          */
         CameraSource.Plan plan;
         try {
-            plan = CameraSource.resolve(this, cameraIndex, width, height);
+            plan = CameraSource.resolve(this, cameraIndex, width, height, rotateDirective);
         } catch (IOException e) {
             /*
              * Resolve before the status line, so a bad index or an

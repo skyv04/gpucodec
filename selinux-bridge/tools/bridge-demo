@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+#
+# bridge-demo -- open a browser page that demonstrates, interactively, exactly
+# what the bridge can and cannot give a web app.
+#
+# It shows three things side by side:
+#
+#   1. the camera, which arrives but does not move, because Chromium reads
+#      --use-file-for-fake-video-capture once when the device is opened and
+#      never again;
+#   2. the microphone, which is live, because it is a real PulseAudio source;
+#   3. a clock and a repaint counter, so a frozen picture cannot be mistaken
+#      for a frozen page.
+#
+# The convincing part is the "Re-open camera" button. Move in front of the
+# phone, press it, and the picture jumps to the present and freezes again --
+# which shows the frames really are arriving, and that only the open reads
+# them.
+#
+# A growing regular file is used rather than the FIFO that bridge-webcam
+# publishes, because Chromium rejects a FIFO outright (NotFoundError) and we
+# want it to get far enough to show the real behaviour.
+#
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${BRIDGE_STATE_DIR:-$HOME/.cache/selinux-bridge}"
+FEED="$STATE_DIR/demo-feed.y4m"
+LOG="$STATE_DIR/demo.log"
+PORT="${DEMO_PORT:-8977}"
+SIZE="${DEMO_SIZE:-640x480}"
+FPS="${DEMO_FPS:-15}"
+CAM="${DEMO_CAMERA:-}"
+SHIM="${PCI_SHIM_LIB:-$HOME/.local/lib/pci-shim/libpcishim.so}"
+SHIM_DATA="${PCI_SHIM_DATA:-$HOME/.local/lib/pci-shim/pci-devices}"
+CLIENT="$HERE/../bridge_client"
+FFMPEG_BIN="${FFMPEG:-$(command -v ffmpeg || true)}"
+DEMO_QUERY="${DEMO_QUERY:-}"
+CHECK=""
+
+usage() {
+    cat <<EOF
+usage: bridge-demo [-i INDEX] [-s WxH] [-f FPS] [-p PORT] [--check SECONDS]
+
+Opens a browser page showing what the bridge can and cannot give a web app:
+a live microphone, a camera that arrives but does not move, and a clock
+proving the page itself is not stuck.
+
+  -i INDEX        camera to use (default: the first front-facing one)
+  -s WxH          capture size (default: $SIZE)
+  -f FPS          capture rate (default: $FPS)
+  -p PORT         port for the demo server (default: $PORT)
+  --check SECONDS run headless for SECONDS, print what the page observed,
+                  and exit nonzero if the camera never opened
+  -h, --help      this text
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -i) CAM="$2"; shift 2 ;;
+        -s) SIZE="$2"; shift 2 ;;
+        -f) FPS="$2"; shift 2 ;;
+        -p) PORT="$2"; shift 2 ;;
+        --check) CHECK="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+W="${SIZE%x*}"; H="${SIZE#*x}"
+
+mkdir -p "$STATE_DIR"
+PIDS=()
+cleanup() {
+    for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+    rm -f "$FEED"
+    echo "demo stopped, feed file removed"
+}
+trap cleanup EXIT INT TERM
+
+if ! timeout 10 "$CLIENT" info >/dev/null 2>&1; then
+    echo "the bridge is not answering -- open SELinux Hardware Bridge on the phone" >&2
+    exit 1
+fi
+
+# A webcam demo wants the selfie camera, so find the first front-facing one
+# rather than hard-coding an index that differs between devices. Falls back
+# to camera 0, which every device has.
+if [ -z "$CAM" ]; then
+    CAM="$(timeout 10 "$CLIENT" info 2>/dev/null \
+           | sed -n 's/^ *camera \([0-9]\+\) \[.*front.*/\1/p' | head -1)"
+    [ -z "$CAM" ] && CAM=0
+fi
+
+CHROME="${CHROMIUM:-$(command -v chromium || command -v chromium-browser || true)}"
+[ -z "$CHROME" ] && { echo "no chromium found; set CHROMIUM=..." >&2; exit 1; }
+
+if ! pactl list short sources 2>/dev/null | grep -q bridge_mic; then
+    echo "starting the microphone bridge"
+    "$HERE/bridge-mic" start >>"$LOG" 2>&1 || echo "  (microphone unavailable; the page will say so)"
+fi
+
+FONT="${DEMO_FONT:-/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf}"
+rm -f "$FEED"
+
+cat >"$STATE_DIR/demo-server.py" <<PY
+import http.server, socketserver, json, os, signal, subprocess, time
+FEED = "$FEED"
+FRAME = $W * $H * 3 // 2
+FPS = $FPS
+ROOT = "$HERE"
+LOG = "$LOG"
+CACHE = "$STATE_DIR"
+#
+# The capture time is burned into every frame. Without it the demo is easy
+# to misread: the picture moves, so it looks live, when in fact it is a
+# recording being played from the beginning. A clock in the corner settles
+# it -- read the time in the picture, read the time on the page.
+#
+STAMP = ("drawtext=fontfile=$FONT:text='%{localtime\\:%T}':x=8:y=8"
+         ":fontsize=28:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=6")
+CMD = (r'''"$CLIENT" camera -i $CAM $W $H $FPS 0 - 2>>"$LOG" </dev/null'''
+       + (r''' | "$FFMPEG_BIN" -v error -f yuv4mpegpipe -i - -vf "%s" '''
+          r'''-f yuv4mpegpipe -y "$FEED"''' % STAMP
+          if "$FFMPEG_BIN" and os.path.exists("$FONT")
+          else r''' > "$FEED"'''))
+
+proc = None
+
+def start_capture():
+    """
+    (Re)start the writer against an empty file.
+
+    Restarting matters more than it looks. Chromium plays this file from
+    its beginning, so the picture starts however far behind the present as
+    the file was long when the camera was opened -- and that offset never
+    closes. Truncating first is what makes the browser's picture start at
+    "now" instead of at "whenever this script was launched".
+    """
+    global proc
+    stop_capture()
+    try:
+        os.remove(FEED)
+    except OSError:
+        pass
+    proc = subprocess.Popen(["bash", "-c", CMD], preexec_fn=os.setsid)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if os.path.exists(FEED) and os.path.getsize(FEED) > FRAME * 2:
+            return True
+        time.sleep(0.1)
+    return False
+
+def stop_capture():
+    global proc
+    if proc and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    proc = None
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **k):
+        super().__init__(*a, directory=ROOT, **k)
+    def log_message(self, *a): pass
+    def json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_POST(self):
+        if self.path.startswith("/upload"):
+            n = int(self.headers.get("Content-Length") or 0)
+            path = os.path.join(CACHE, "clip-%s.webm" % time.strftime("%H%M%S"))
+            got = 0
+            with open(path, "wb") as f:
+                while got < n:
+                    chunk = self.rfile.read(min(65536, n - got))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+            print("CLIP %s (%d bytes)" % (path, got), flush=True)
+            self.json({"path": path, "bytes": got})
+            return
+        self.send_response(404)
+        self.end_headers()
+    def do_GET(self):
+        if self.path.startswith("/report?"):
+            import urllib.parse
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+            print("REPORT " + q.get("j", [""])[0], flush=True)
+            self.send_response(204)
+            self.end_headers()
+            return
+        if self.path.startswith("/restart"):
+            okv = start_capture()
+            n = os.path.getsize(FEED) if os.path.exists(FEED) else 0
+            self.json({"ok": okv, "frames": n // FRAME, "fps": FPS})
+            return
+        if self.path.startswith("/feed"):
+            try:
+                n = os.path.getsize(FEED)
+            except OSError:
+                n = 0
+            self.json({"bytes": n, "frames": n // FRAME, "fps": FPS})
+            return
+        if self.path == "/" or self.path.startswith("/?"):
+            self.path = "/bridge-demo.html"
+        return super().do_GET()
+class TS(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+if not start_capture():
+    print("the camera produced nothing -- check " + LOG, flush=True)
+    raise SystemExit(1)
+# A bare SIGTERM would kill this process before the finally clause below
+# ever runs, orphaning ffmpeg and the bridge client -- they then write to a
+# deleted file forever. Turn the signal into a normal exit instead.
+def _bye(*_):
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, _bye)
+signal.signal(signal.SIGINT, _bye)
+try:
+    with TS(("127.0.0.1", $PORT), H) as s:
+        s.serve_forever()
+finally:
+    stop_capture()
+PY
+
+echo "starting the camera feed (${W}x${H} @ ${FPS}fps, camera $CAM)"
+python3 "$STATE_DIR/demo-server.py" >>"$LOG" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 60); do
+    [ -s "$FEED" ] && break
+    sleep 0.25
+done
+if [ ! -s "$FEED" ]; then
+    echo "the camera produced nothing -- check $LOG" >&2
+    exit 1
+fi
+echo "feed live: $(stat -c %s "$FEED") bytes and growing"
+
+if [ -f "$SHIM" ]; then
+    export LD_PRELOAD="$SHIM${LD_PRELOAD:+:$LD_PRELOAD}"
+    export PCI_DEVICES_SHIM="$SHIM_DATA"
+fi
+
+if [ -n "$CHECK" ]; then
+    echo "headless self-check: driving the page for ${CHECK}s"
+    MARK=$(wc -l <"$LOG")
+    timeout $((CHECK + 60)) "$CHROME" \
+        --headless=old --no-sandbox --disable-dev-shm-usage \
+        --user-data-dir="$STATE_DIR/demo-profile-check" \
+        --use-fake-device-for-media-stream \
+        --use-file-for-fake-video-capture="$FEED" \
+        --use-fake-ui-for-media-stream \
+        --autoplay-policy=no-user-gesture-required \
+        "http://127.0.0.1:$PORT/?auto=$CHECK" >>"$LOG" 2>&1
+    REPORT="$(tail -n +$((MARK + 1)) "$LOG" | sed -n 's/^REPORT //p' | tail -1)"
+    if [ -z "$REPORT" ]; then
+        echo "FAIL: the page never reported back -- see $LOG" >&2
+        exit 1
+    fi
+    python3 - "$REPORT" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1])
+for k, v in r.items():
+    print(f"  {k:18} {v}")
+grew = (r.get("feedFramesEnd") or 0) - (r.get("feedFramesStart") or 0)
+if not r.get("videoOpened"):
+    print("FAIL: the browser never opened the camera")
+    sys.exit(1)
+if not r.get("pageTicks"):
+    print("FAIL: the page clock never ticked, so the page itself was stuck")
+    sys.exit(1)
+print()
+lag = r.get("lagSeconds")
+print(f"camera opened at {r['videoSize']}; the feed gained {grew} frames"
+      f" while the browser played {r.get('videoCurrentTime')}s of video.")
+if lag is None:
+    print("NOTE: no lag measurement -- the video never started playing.")
+elif lag <= 2.0:
+    print(f"LIVE ENOUGH: the picture is {lag}s behind the present. Restarting"
+          " the feed at open is what makes this work; gap #17 is the reason"
+          " it has to be done at all.")
+else:
+    print(f"STALE: the picture is {lag}s behind the present and Chromium"
+          " will not seek forward -- gap #17.")
+PY
+    exit $?
+fi
+
+echo
+echo "opening the browser at http://127.0.0.1:$PORT/"
+echo "close the window (or press Ctrl-C here) to stop the demo"
+echo
+
+# --use-fake-device-for-media-stream is required, not optional: without it
+# Chromium does not register the file video device at all and
+# getUserMedia({video:true}) fails with videoSize 0x0 (verified). The cost
+# is that the same switch replaces the microphone with a synthetic 440 Hz
+# tone, so the level meter below the video is Chromium's test signal and
+# NOT the phone -- a clip recorded here came back clipping at full scale
+# with a dead-constant RMS of 14448. That is gap #17 in one line: one
+# switch governs both devices, so a tab gets the real camera or the real
+# microphone, never both. For genuinely live browser audio, run bridge-mic
+# and open a browser WITHOUT this flag.
+"$CHROME" \
+    --no-sandbox \
+    --disable-dev-shm-usage \
+    --user-data-dir="$STATE_DIR/demo-profile" \
+    --use-fake-device-for-media-stream \
+    --use-file-for-fake-video-capture="$FEED" \
+    --use-fake-ui-for-media-stream \
+    --autoplay-policy=no-user-gesture-required \
+    --new-window "http://127.0.0.1:$PORT/$DEMO_QUERY" >>"$LOG" 2>&1

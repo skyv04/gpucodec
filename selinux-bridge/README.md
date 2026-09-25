@@ -59,8 +59,9 @@ to remind you.
 | `tools/hw-transcode` | Wrapper that pipes an arbitrary ffmpeg-readable input through the bridge's hardware encoder and remuxes to a normal container — the hardware-codec analogue of this repo's `agc-from`/`agc-to`. `-c hevc` selects HEVC; `-D` also decodes on the hardware block, making the transcode hardware end to end. |
 | `tools/selftest` | Full regression suite. Needs no phone and no installed APK: it runs everything against the mock bridge, including fault injection that cannot be arranged reliably on real hardware. |
 | `tools/bridge-webcam` | Publishes the phone camera as a **FIFO** carrying Y4M, which native applications (`ffplay`, `ffmpeg`, VLC, OBS…) read like any other source. A FIFO makes the camera on-demand for free: opening one for write blocks until a reader attaches, so the camera is not opened — and its indicator not lit — until something actually wants frames, and it is released the moment the reader goes away. |
-| `tools/bridge-mic` | Publishes the phone microphone as a **real PulseAudio source** (`bridge_mic`) via `module-pipe-source`, and makes it the default. No kernel module and no root: PulseAudio is a userspace daemon, so a virtual microphone is something an unprivileged user can simply create. Every audio application, browsers included, then finds it the ordinary way. |
+| `tools/bridge-mic` | Publishes the phone microphone as a **real PulseAudio device** (`bridge_mic`, recorded from as `bridge_mic.monitor`) using a null sink fed by `pacat`, and makes it the default. No kernel module and no root: PulseAudio is a userspace daemon, so a virtual microphone is something an unprivileged user can simply create. Every audio application, browsers included, then finds it the ordinary way. It deliberately does **not** use `module-pipe-source`, which has no flow control and inflates the audio by 20–45%; see "Why a null sink" for the measurements. |
 | `tools/bridge-browser` | Launches Chromium wired to the bridged microphone, and optionally (`--clip SECONDS`) to a short recording from the bridged camera. It does **not** offer a live browser camera, because Chromium cannot accept one — see gap #17. |
+| `tools/bridge-demo` + `bridge-demo.html` | An interactive page for seeing the browser situation first-hand rather than taking it on faith. It starts the camera into a growing file, then serves a page showing the browser's picture next to a signature of its pixels, the live frame count of the file on disk, a microphone meter and a ticking clock. Every frame carries the time it was captured, burned in, so the delay is readable against the page's own clock. **Record 10 s** captures a clip through `MediaRecorder` for offline analysis. |
 | `tools/mock-bridge.py` | A protocol-v6 bridge that reproduces the awkward parts of MediaCodec — codec-config packets, one packet per access unit, lookahead that swallows frames before emitting anything, decode format records — backed by a real x264/x265 subprocess so the output is a genuine stream. It also fakes capture, including the HAL's habit of rounding a requested camera size to one it actually offers, and can be told to refuse a permission (`MOCK_DENY_CAMERA`, `MOCK_DENY_MIC`). `MOCK_RESIZE_AT=N` forces a mid-stream resolution change, which is impractical to provoke on real hardware. |
 | `tools/test-i420` | JVM unit tests for `I420.java` across planar, semi-planar, padded-stride, padded-slice-height, odd-dimension and cropped layouts. |
 
@@ -405,6 +406,35 @@ ffplay -f yuv4mpegpipe -i "$(tools/bridge-webcam path)"
 ffmpeg -f yuv4mpegpipe -i "$(tools/bridge-webcam path)" -t 10 clip.mp4
 ```
 
+### The picture comes out upright
+
+A phone's camera sensor is mounted to suit the industrial design, not the
+screen, so the frames the HAL hands over are on their side — on this device
+the back sensors read 90° and the front ones 270°, which is typical. The
+bridge applies that angle for you, so a capture is upright without anyone
+downstream having to know. `info` prints each sensor's angle, and a quarter
+turn swaps the *announced* dimensions, which is why reading the format
+record rather than assuming your request was honoured is not optional:
+
+```
+camera 0 [hal id 0, back,  sensor 90deg]  max 4080x3060, 24 sizes
+camera 2 [hal id 1, front, sensor 270deg] max 3648x2736, 21 sizes
+```
+
+```
+./bridge_client camera -i 2 640 480 15 2 out.y4m   # -> 480x640, upright
+./bridge_client camera -i 2 --rotate none  ...     # exactly what the sensor saw
+./bridge_client camera -i 2 --rotate 180   ...     # or pick the angle yourself
+```
+
+The size you ask for still selects the **sensor** mode, so a quarter turn
+returns that many pixels with the dimensions swapped rather than quietly
+picking a worse mode to hit the number you typed. Rotation is a blocked
+transpose rather than the obvious nested loop, because the obvious one
+misses the cache on every write; measured at 1280x720 it costs nothing
+worth reporting — **24.8 fps rotated against 25.0 fps raw**, byte counts
+identical.
+
 Or straight from the client, without the supervisor:
 
 ```
@@ -412,7 +442,8 @@ Or straight from the client, without the supervisor:
 ./bridge_client mic 48000 1 0 - > mic.s16     # raw S16LE
 ```
 
-The microphone becomes a real PulseAudio source called `bridge_mic`, and
+The microphone becomes a real PulseAudio device called `bridge_mic`, whose
+monitor `bridge_mic.monitor` is what applications record from, and
 `bridge-mic` makes it the default — which matters more than it sounds,
 because `getUserMedia({audio:true})` takes the *default* source, and the
 default here is otherwise a silent monitor. A working virtual microphone
@@ -425,18 +456,63 @@ measured here at **−72.7 dBFS** against `mic`'s −34.0 — because
 suppressing steady ambient noise is exactly what it is for. That is the
 feature working, not a broken source; speech still comes through.
 
-One constraint worth knowing if you move the FIFO: PulseAudio runs in
-**Termux**, not in this container, so the path must exist identically on
-both sides. `/data/data/com.termux/files/home` does; `/tmp` does not, and
-the only symptom is `module-pipe-source` failing to load with no
-explanation.
+#### Why a null sink and not `module-pipe-source`
+
+`module-pipe-source` is the obvious way to turn a FIFO into a microphone,
+and it silently destroys audio/video sync. It has no flow control: when the
+pipe is empty at poll time it manufactures silence to keep the source
+running, then still emits the real samples when they arrive. The source
+therefore produces **more** audio than went into it, and the excess
+accumulates for as long as the call lasts.
+
+The phone was never at fault. Measured on this device:
+
+| Path | Audio produced | Wall clock | Ratio |
+|---|---|---|---|
+| Bridge → file, continuous | 14.90 s | 15.02 s | **0.992×** |
+| `module-pipe-source` → `parec` | 24.10 s | 20.02 s | **1.204×** |
+| `module-pipe-source` → `ffmpeg` | 44.30 s | 30.64 s | **1.445×** |
+| **null sink + `pacat` → `parec`** | **19.95 s** | **20.03 s** | **0.996×** |
+
+So `bridge-mic` now loads `module-null-sink` and feeds it with `pacat`.
+`pacat` is an ordinary PulseAudio playback client, so the server
+rate-matches it the way it does any other stream — an underrun becomes
+silence *in place of* real audio rather than *in addition to* it. End to
+end, a 25 s camera-plus-microphone capture drifted **0.128 s**, against
+**14.3 s** over 30 s through the pipe source.
+
+Two things fall out of the change. The FIFO becomes container-local,
+because only `pacat` reads it and `pacat` runs on this side — the old
+arrangement needed a path visible identically to both this container and
+Termux, and failed with nothing but `Module initialization failed` when it
+was not. And `device.description` must contain no spaces or parentheses:
+`pactl` joins module arguments into one string and re-splits on
+whitespace, so a quoted value with a space fails the same opaque way.
 
 ### Browsers
 
 Audio works — start `bridge-mic` and any web app gets live phone audio.
-**Live video does not**, and cannot; see gap #17 for the measurements.
-`tools/bridge-browser --clip 5` records five seconds from the camera and
-offers Chromium that instead, which is real footage but a loop.
+Injected video works too, and `tools/bridge-demo` keeps it within **0.13 s**
+of the present by truncating the feed just before the camera is opened.
+What you cannot have is *both at once*: the Chromium switch that registers
+the file camera also replaces the microphone with a synthetic tone. See
+gap #17 for the measurements.
+
+If you would rather see that limit than read about it, `tools/bridge-demo`
+opens a page that demonstrates it live:
+
+```sh
+tools/bridge-demo                     # auto-selects the front camera
+tools/bridge-demo -i 0 -s 1280x720    # or pick one from 'bridge_client info'
+```
+
+Press **Start camera** and the picture freezes on the moment it opened,
+while right beside it the feed file's frame count climbs and the clock
+ticks — so nothing is stalled except Chromium's read. Move in front of the
+phone, press **Re-open camera**, and the picture jumps to the present and
+freezes again. **Start microphone** shows the contrast: that meter really
+is live. The feed file grows at about 7 MB/s at 640x480@15 and is deleted
+when the demo exits.
 
 ## Testing without a device
 
@@ -815,8 +891,9 @@ Status column: **fixed** entries have been implemented and verified (see
 "Verification of the fixes" below). Two gaps remain open, and neither is
 open for want of effort: #4's recoverable halves now heal themselves but its
 residue is a deliberate Android platform behaviour that no unprivileged app
-can change, and #17 is a limitation inside Chromium that nothing on this
-side of the socket can reach.
+can change, and #17 is now down to a single irreducible Chromium behaviour —
+one command-line switch governs the fake camera and the fake microphone
+together, so a tab can be given one or the other but not both.
 
 | # | Gap | Severity | Status | Fix that shipped |
 |---|---|---|---|---|
@@ -836,7 +913,7 @@ side of the socket can reach.
 | 14 | **Rate control was inaccurate.** `KEY_BITRATE_MODE` was never set, so Codec2 picked its own default -- VBR on this device's `c2.qti.*.encoder` components, where the requested bitrate is only an average the encoder may exceed freely. An explicit `-b:v` came back **+25% at 2 Mbps, +31% at 6 Mbps and +34% at 12 Mbps**, measured on ordinary content rather than a synthetic worst case. (Distinct from gap #11: that was zero timestamps making the encoder think the clip was instantaneous, which *under*-shot; this is the mode itself.) | Medium | ✅ fixed | Protocol v5 carries a rate-control mode in the **high byte of the codec field**, so the 24-byte header is unchanged and a v3/v4 client -- which sends a bare 0..3 -- lands on the new CBR default automatically. `bridge_client -r cbr\|vbr\|cq`, `hw-transcode -r`, and `ffmpeg -rc_mode cbr\|vbr\|cq`. CQ reinterprets the bitrate field as a quality in 1..100. An unsupported mode falls back to plain `KEY_BIT_RATE` rather than failing the session, and `info` now lists which modes each encoder advertises. |
 | 15 | **A stale process was invisible.** Android normally kills an app's process when its package is replaced, so the next start runs the new code. A long-lived foreground service makes surviving that much more likely, and nothing then reloads it: `BootReceiver`'s `MY_PACKAGE_REPLACED` handler calls `startForegroundService()`, but that only delivers another `onStartCommand()` to the **already loaded** classes. The bridge kept serving the old protocol while the user was looking at a successful install, with no symptom at all beyond a version number that never changed. Hit for real on the v4 → v5 update. | Medium | ✅ fixed | `info` now reports the **build timestamp of the code actually answering**, and the service compares the package's `lastUpdateTime` against the value this process saw at startup. `lastUpdateTime` moves only on replacement, so a difference means the package changed *while this process was already running* — exactly the stale case, with no timing heuristic to get wrong. The app footer always shows `protocol vN · build <timestamp>`, in the same format `info` uses, so the running version can be read off the screen and compared directly. When a mismatch is detected the warning appears in `info`, in `bridge.log`, and as a banner at the top of the app carrying a **Restart now** button, which ends the process so `START_STICKY` restarts the service on the new code — refusing while any transcode is in flight. |
 | 16 | **Constant quality silently degraded to VBR.** Qualcomm splits rate control across *components*: `c2.qti.hevc.encoder` does CBR and VBR, while constant quality lives on a **separate** `c2.qti.hevc.encoder.cq`. Picking the first `c2.qti.*` match therefore handed every CQ request to a component that cannot do CQ, which then fell back to its default — VBR — and encoded anyway. `-c h264 -r cq` produced a file **byte-for-byte the same size** as `-r vbr` (7,679,474 B), i.e. the mode was doing nothing at all. Found by this round of hardware testing, in a feature added one commit earlier. | High | ✅ fixed | Component selection is now rate-control aware and prefers one that supports the requested mode, so CQ lands on `*.encoder.cq`. If no component supports it the encode is **refused**, naming what is supported (`rate control 'cq' is not supported by c2.qti.avc.encoder (supported: cbr,vbr)`), because silently substituting rate control is precisely what hid #14. |
-| 17 | **A browser cannot be given a live camera.** The bridged camera works for native applications, but a web app — a meeting in a tab, the case this was asked for — cannot have it. Chromium's only route for an injected camera is `--use-file-for-fake-video-capture`, and its `FileVideoCaptureDevice` **reads the file when the device is opened and never looks at it again**. Measured two independent ways: appending live frames while it was reading produced a constant image, and *rewriting every frame in place* 22 s after it started produced a constant image too (`means=56.0` throughout, from a file whose every byte had been changed to luma 200). Pointing the flag at a FIFO fails earlier still — `NotFoundError` at open. An earlier result that appeared to show appends working was an artifact: Chromium takes ~15 s to start here, so the append had already finished before the file was opened. **This is a Chromium limitation, not a bridge one, and no amount of work on this side can fix it.** | Medium | ⚠️ open (not fixable here) | Two partial answers ship instead of a pretended one. **Audio is genuinely solved**: `tools/bridge-mic` creates a real PulseAudio source, so `getUserMedia({audio:true})` returns live phone audio in any browser — a meeting in a tab gets working sound. For video, `tools/bridge-browser --clip SECONDS` records from the phone camera and hands Chromium that, which is real footage but a **loop, not a live feed**, and is labelled as such everywhere it appears. Native applications are unaffected and get a genuinely live camera from the FIFO. The one untried route is PipeWire plus the `xdg-desktop-portal` camera portal (`--enable-webrtc-pipewire-camera`), which Chromium *does* re-read continuously; `pipewire` is not installed here and this container has no root to install it, so it is **untested rather than ruled out**. |
+| 17 | **A browser cannot be given a live camera *and* live audio at the same time.** Chromium's only route for an injected camera is `--use-file-for-fake-video-capture`, and that file device is only registered when `--use-fake-device-for-media-stream` is also present — verified here by removing it, after which `getUserMedia({video:true})` fails outright (`videoOpened False`, `0x0`). But that same switch also replaces the **microphone** with a synthetic tone: a clip recorded through the demo came back with audio clipping at full scale and a dead-constant RMS of 14448, nothing like the room. So a tab can have the phone's camera or the phone's microphone, never both. A second, softer limit applies to the video itself: `FileVideoCaptureDevice` plays the file **from its first byte and never seeks**, so the picture starts as far behind the present as the file was long when the camera opened, and that offset never closes — which is what made this look like a frozen image in earlier testing. It is not frozen: a headless self-check counted **50 distinct frames and 0 repeats** in 25 s. | Medium | ⚠️ partly fixed | The lag half is solved: `tools/bridge-demo` truncates the feed immediately before calling `getUserMedia`, which collapses the delay from minutes to **0.13 s measured**, and the burned-in capture clock in the picture matches the page's wall clock to the second in a screenshot. The audio/video exclusivity is **not** solvable from this side — it is one Chromium switch governing both devices. For a call that needs sound, `tools/bridge-mic` alone gives any tab genuinely live phone audio; for one that needs the camera, the fake-device switch is required and the microphone becomes synthetic. PipeWire plus the `xdg-desktop-portal` camera portal (`--enable-webrtc-pipewire-camera`) would sidestep both halves, but `pipewire` cannot be installed without root here, so it stays **untested rather than ruled out**. |
 | 18 | **A capture session was accepted before it was checked.** `handleCamera` wrote its OK status line *and then* called `CameraSource.stream()`, which is where the camera index is validated. So an invalid index — `bridge_client camera -i 9` — produced `handshake ok, capture source: camera:9`, a session that opened and immediately stopped, an empty file, and **exit 0**. The client's own accounting said `camera: 0 unit(s), 0 byte(s)` and nothing anywhere said why. The mock refused it correctly, and the selftest passed, because the mock validates *before* replying — so the test suite was asserting the right behaviour against the wrong ordering, and only real hardware could show the difference. Found in the first hour of running v6 against the phone, in a feature added one commit earlier. | Medium | ✅ fixed | Camera selection is now a separate `CameraSource.resolve()` that runs **before** the status line, so a bad index is refused with `camera index 9 out of range (this device has 4, so 0..3; 'bridge_client info' lists them)` and a nonzero exit. `MicSource.check()` does the same for an audio format the device will not accept. Belt and braces on the client too: a capture that ends without ever receiving a format record now reports `capture produced nothing` and fails, so this class of silent acceptance cannot recur even from a bridge that gets the ordering wrong. The selftest gained a stand-in bridge that accepts and then dies, which is the exact shape of the bug. |
 
 ## Verification of the fixes
@@ -908,9 +985,17 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #6 camera | Reader detaches mid-stream | `reader gone, camera released`, writer re-armed for the next reader, no orphan left behind |
 | #6 camera | `bridge-webcam status` across idle → reading → idle | reports `idle` / `streaming (reader pid …)` / `idle`, read from `/proc/*/fd` rather than inferred from the log |
 | #6 mic | `bridge-mic start`, then `parec --device=bridge_mic` | source created, made default, **rms 8486** — real signal, not silence |
+| #6 mic | Bridge → file, continuous, 15 s | **14.90 s of audio in 15.02 s of wall clock (0.992x)** — the phone delivers 48 kHz accurately |
+| #6 mic | Old path: `module-pipe-source` → `parec`, 20 s | **24.10 s of audio (1.204x)** — the pipe source manufactures silence during gaps and still emits the real samples |
+| #6 mic | Old path: `module-pipe-source` → `ffmpeg`, 30 s | **44.30 s of audio (1.445x)**, i.e. 14.3 s of lip-sync drift in half a minute |
+| #6 mic | New path: null sink + `pacat` → `parec`, 20 s | **19.95 s of audio (0.996x)**, RMS 610, 99.9% non-zero — correct rate, real audio |
+| #6 mic | 40 s camera + microphone captured together, new path | **600 video frames (40.00 s) and 40.00 s of audio — zero net drift** |
+| #6 mic | Feeder killed, leaving the source with no writer | reader **blocks forever** rather than failing; `bridge-mic status` now reports `half-dead` instead |
 | #17 browser | Chromium `getUserMedia({audio:true})` against `bridge_mic` | device enumerated and **non-zero RMS** (0.0366 → 0.0095 as WebRTC's AGC settles) — browser audio works |
-| #17 browser | Chromium `getUserMedia({video:true})` against a **growing** file, frames appended live | `means=130.0` constant — the grey prefill, never the appended frames |
-| #17 browser | Same, with every frame **rewritten in place** from luma 64 → 200 after 22 s | `means=56.0` constant — the file is buffered at open and never re-read |
+| #17 browser | Chromium `getUserMedia({video:true})` against a **growing** file | picture follows the file: **50 distinct frames, 0 repeats** in 25 s. (An earlier run reported a constant `means=130.0` and was misread as a frozen reader — the prefill was uniform grey, so a moving picture and a stuck one looked identical.) |
+| #17 browser | Feed truncated immediately before `getUserMedia` | **lag 0.13 s**, and in a screenshot the clock burned into the picture reads `14:24:33` while the page's own clock reads `2:24:33 PM` — the same second |
+| #17 browser | Chromium launched **without** `--use-fake-device-for-media-stream` | `videoOpened False`, `videoSize 0x0` — the file video device is not registered without that switch |
+| #17 browser | Audio recorded through the demo **with** that switch | full-scale clipping, constant RMS 14448 — Chromium's synthetic tone, not the phone. The switch fakes the microphone as well as the camera |
 | #17 browser | Same, pointed at a FIFO | `NotFoundError: Requested device not found` — rejected at open |
 | #17 browser | `bridge-browser --clip 3`, then Chromium `getUserMedia({video:true})` | `ok w=640 h=480 meanR=138.3 label=…/webcam-clip.y4m` — a recording from the phone camera *is* accepted as a camera, which is why `--clip` is the one video path offered |
 
@@ -936,14 +1021,17 @@ key is now stable (gap #9), so it installs as an in-place update.
   from recents, or Settings → Force stop) still requires a manual launch,
   because Android blocks every receiver of a force-stopped package until
   the user opens it. That residue of gap #4 is not fixable without root.
-- **A browser still cannot have a live camera**, and this one is not a
-  gap in the bridge: Chromium buffers `--use-file-for-fake-video-capture`
-  at open and never re-reads it, so no live source can be injected that
-  way (gap #17 has the measurements). Native applications get a genuinely
-  live camera from `bridge-webcam`'s FIFO, and browsers get **working
-  live audio** from `bridge-mic`; for browser video the honest options
-  are a recorded loop (`bridge-browser --clip`) or PipeWire, which needs
-  root to install and is therefore untested here.
+- **A browser can have the phone's camera or the phone's microphone, but
+  not both at once**, and this one is not a gap in the bridge: the single
+  Chromium switch that registers the injected camera also replaces the
+  microphone with a synthetic tone (gap #17 has the measurements). The
+  earlier claim here — that Chromium buffers the file at open and never
+  re-reads it — was wrong; it reads continuously but starts from the first
+  byte, so `bridge-demo` truncates the feed just before opening and gets
+  the picture to within **0.13 s** of the present. Native applications get
+  a genuinely live camera from `bridge-webcam`'s FIFO, and browsers get
+  **working live audio** from `bridge-mic`. PipeWire would lift the
+  either/or restriction but needs root to install and is untested here.
 - **Sensors, GPS, NFC and the other hardware are still not bridged.**
   The pattern generalises — a new `mode=`, a branch in
   `BridgeService.java` using the relevant Android API, and a

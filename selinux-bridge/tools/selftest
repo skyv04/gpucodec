@@ -480,24 +480,59 @@ fi
 
 head_ "Capture (protocol v6)"
 
-# The bridge rounds a size request to something the camera really offers, so
-# a client must read the announced geometry rather than assume it got what it
-# asked for. 700x500 is not a real camera size; 640x480 is the nearest.
+# The bridge rounds a size request to something the camera really offers, and
+# rotates the picture upright, so a client must read the announced geometry
+# rather than assume it got what it asked for. 700x500 is not a real camera
+# size; 640x480 is the nearest, and the mock's sensor is mounted at 90
+# degrees like most phones, so the picture arrives as 480x640.
 if BRIDGE_PORT=$PORT ./bridge_client camera 700 500 10 5 "$TMP/cam.y4m" \
         >/dev/null 2>"$TMP/cam.err"; then
     hdr=$(head -c 60 "$TMP/cam.y4m" | head -1)
-    if echo "$hdr" | grep -q 'W640 H480'; then
+    if echo "$hdr" | grep -q 'W480 H640'; then
         ok "camera capture honours the announced size, not the requested one"
     else
-        bad "camera Y4M header was '$hdr', expected W640 H480"
+        bad "camera Y4M header was '$hdr', expected W480 H640"
     fi
 else
     bad "camera capture exited non-zero: $(tail -1 "$TMP/cam.err")"
 fi
 
-# Five frames of 640x480 I420 plus the header and five FRAME markers.
+# --rotate none must hand back exactly what the sensor saw, which is the
+# only way to tell a rotation bug from a sensor that really is landscape.
+if BRIDGE_PORT=$PORT ./bridge_client camera --rotate none 700 500 10 2 \
+        "$TMP/cam-raw.y4m" >/dev/null 2>"$TMP/camraw.err"; then
+    hdr=$(head -c 60 "$TMP/cam-raw.y4m" | head -1)
+    if echo "$hdr" | grep -q 'W640 H480'; then
+        ok "--rotate none delivers the unrotated sensor geometry"
+    else
+        bad "--rotate none gave '$hdr', expected W640 H480"
+    fi
+else
+    bad "--rotate none exited non-zero: $(tail -1 "$TMP/camraw.err")"
+fi
+
+# 180 keeps the shape but must still be accepted and announced as such,
+# and a bogus directive must be named rather than quietly ignored.
+if BRIDGE_PORT=$PORT ./bridge_client camera --rotate 180 700 500 10 2 \
+        "$TMP/cam-180.y4m" >/dev/null 2>&1 \
+        && head -c 60 "$TMP/cam-180.y4m" | head -1 | grep -q 'W640 H480'; then
+    ok "--rotate 180 is accepted and keeps the sensor's shape"
+else
+    bad "--rotate 180 did not produce a 640x480 stream"
+fi
+
+if ./bridge_client camera --rotate sideways 640 480 10 2 "$TMP/nope.y4m" \
+        >/dev/null 2>"$TMP/badrot.err"; then
+    bad "an unknown rotation was silently accepted"
+elif grep -q "unknown rotation" "$TMP/badrot.err"; then
+    ok "an unknown rotation is refused by name"
+else
+    bad "an unknown rotation failed without saying why"
+fi
+
+# Five frames of 480x640 I420 plus the header and five FRAME markers.
 if [ -s "$TMP/cam.y4m" ]; then
-    want=$(( 640 * 480 * 3 / 2 * 5 ))
+    want=$(( 480 * 640 * 3 / 2 * 5 ))
     have=$(wc -c <"$TMP/cam.y4m")
     if [ "$have" -gt "$want" ] && [ "$have" -lt $(( want + 200 )) ]; then
         ok "camera capture delivers exactly the requested frame budget"

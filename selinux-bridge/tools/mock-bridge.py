@@ -26,6 +26,7 @@ Env:    MOCK_RESIZE_AT=N   halve the picture size from decoded frame N on
         MOCK_DENY_CAMERA=1 / MOCK_DENY_MIC=1  refuse capture the way an
                             ungranted runtime permission does
         MOCK_CAMERAS=N     how many cameras to pretend exist (default 2)
+        MOCK_SENSOR_ORIENTATION=D  sensor mounting angle for "auto" (default 90)
         MOCK_CAMERA_EXACT=1  honour the requested size instead of rounding
 """
 import os
@@ -51,6 +52,7 @@ UNSUPPORTED_RC = {m for m in os.environ.get("MOCK_UNSUPPORTED_RC", "").split(","
 DENY_CAMERA = os.environ.get("MOCK_DENY_CAMERA", "") not in ("", "0")
 DENY_MIC = os.environ.get("MOCK_DENY_MIC", "") not in ("", "0")
 MOCK_CAMERAS = int(os.environ.get("MOCK_CAMERAS", "2"))
+MOCK_SENSOR_ORIENTATION = int(os.environ.get("MOCK_SENSOR_ORIENTATION", "90"))
 # Off by default so the mock rounds the requested size like a real HAL does.
 CAMERA_EXACT = os.environ.get("MOCK_CAMERA_EXACT", "") not in ("", "0")
 
@@ -259,7 +261,7 @@ def handle_decode(conn, f, codec):
           + (f" (resized at {RESIZE_AT})" if RESIZE_AT else ""), flush=True)
 
 
-def handle_camera(conn, w, h, fps, max_frames, cam_index):
+def handle_camera(conn, w, h, fps, max_frames, cam_index, rotate=0):
     """
     Synthetic camera. Emits a format record then I420 frames.
 
@@ -268,6 +270,11 @@ def handle_camera(conn, w, h, fps, max_frames, cam_index):
     and a client that assumes it got what it asked for is broken in a way
     that only shows up on hardware. Making the mock round too means the
     selftest catches it here instead.
+
+    Rotation is modelled the same way the app does it -- the hint picks the
+    sensor size and a quarter turn swaps the *announced* dimensions -- so
+    the selftest can check that a client believes the format record rather
+    than its own request.
     """
     if DENY_CAMERA:
         msg = (b"the bridge app has not been granted CAMERA."
@@ -281,8 +288,19 @@ def handle_camera(conn, w, h, fps, max_frames, cam_index):
                % (cam_index, MOCK_CAMERAS, MOCK_CAMERAS - 1)).encode()
         conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
         return
+    if rotate not in (0, 1, 2, 3, 4):
+        msg = ("rotation directive %d is not one of 0=auto 1=none 2=90"
+               " 3=180 4=270" % rotate).encode()
+        conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+        return
 
-    rw, rh = (w, h) if CAMERA_EXACT else round_to_camera_size(w, h)
+    # Pretend every mock sensor is mounted at 90 degrees, like most phones.
+    degrees = {0: MOCK_SENSOR_ORIENTATION, 1: 0, 2: 90, 3: 180, 4: 270}[rotate]
+    quarter = degrees in (90, 270)
+
+    want_w, want_h = w, h
+    sw, sh = (want_w, want_h) if CAMERA_EXACT else round_to_camera_size(want_w, want_h)
+    rw, rh = (sh, sw) if quarter else (sw, sh)
     name = ("camera:%d" % cam_index).encode()
     conn.sendall(struct.pack(">ii", 0, len(name)) + name)
     conn.sendall(struct.pack(">iii", -2, rw, rh))
@@ -371,7 +389,7 @@ def handle(conn):
             conn.sendall(struct.pack(">i", len(payload)) + payload)
             conn.sendall(struct.pack(">i", -1))
         elif mode == 4:
-            handle_camera(conn, w, h, fps, br, codec)
+            handle_camera(conn, w, h, fps, br, codec, rc)
         elif mode == 5:
             handle_mic(conn, w, h, br, codec)
         elif codec not in CODECS:

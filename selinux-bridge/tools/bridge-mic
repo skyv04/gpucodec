@@ -4,17 +4,35 @@
 # PulseAudio source.
 #
 # Unlike the camera, this one lands properly. /dev/snd/* is denied here, so
-# there is no ALSA device to expose, but PulseAudio is a userspace daemon and
-# module-pipe-source creates a source out of a named pipe with no kernel
-# involvement, no module and no root. Anything that uses PulseAudio -- which
-# on this system is everything, including Chromium -- then sees an ordinary
-# microphone.
+# there is no ALSA device to expose, but PulseAudio is a userspace daemon, so
+# a virtual device needs no kernel involvement and no root. Anything that
+# uses PulseAudio -- which on this system is everything, including Chromium
+# -- then sees an ordinary microphone.
 #
-# The one non-obvious constraint: the PulseAudio server belongs to Termux,
-# not to this container, so the FIFO has to sit on a path that resolves
-# identically on both sides. Paths under /tmp are private to the container
-# and the server simply cannot see them -- the symptom is "Failure: Module
-# initialization failed" with no further explanation.
+# Why a null sink fed by pacat, and not module-pipe-source:
+#
+#   module-pipe-source is the obvious choice and it is wrong. It has no flow
+#   control. When the FIFO happens to be empty at poll time it manufactures
+#   silence to keep the source running, then still emits the real samples
+#   when they turn up -- so the source produces MORE audio than went in, and
+#   the excess grows without bound. Measured here: the bridge delivers
+#   48000 samples/s to within 0.8% (14.90 s of audio in 15.02 s of wall
+#   clock), but reading it back through module-pipe-source yielded 24.10 s
+#   in 20.02 s (1.20x) and 44.30 s in 30.64 s (1.45x). In a video call that
+#   is audio sliding ever further behind the picture, which is exactly the
+#   lip-sync failure this tool exists to avoid.
+#
+#   pacat is a real PulseAudio stream client, so the server rate-matches it
+#   the way it does any other playback stream: underruns become silence
+#   without stealing the stream's place in time. Measured the same way:
+#   14.93 s of audio in 15.03 s of wall clock (0.993x), with the audio
+#   intact (99.7% non-zero samples, RMS 597 against 557 captured direct).
+#
+#   The bonus is that the FIFO becomes container-local. pacat speaks the
+#   PulseAudio protocol, so only pacat has to read the pipe -- the server
+#   never does. The old arrangement needed a path that resolved identically
+#   inside this container and inside Termux, and failed with nothing but
+#   "Module initialization failed" when it did not.
 #
 # Usage:
 #   bridge-mic [-s SOURCE] [-r RATE] [-c CHANNELS] [start|stop|status]
@@ -24,11 +42,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT="${BRIDGE_CLIENT:-$HERE/../bridge_client}"
 
-# Visible under the same absolute path to both sides. This is load-bearing.
-SHARED_DIR="${BRIDGE_SHARED_DIR:-/data/data/com.termux/files/home/.selinux-bridge}"
-FIFO="$SHARED_DIR/mic.fifo"
-
+# Container-local: only pacat reads this, and pacat runs on this side.
 STATE_DIR="${BRIDGE_STATE_DIR:-$HOME/.cache/selinux-bridge}"
+FIFO="$STATE_DIR/mic.fifo"
+
 PIDFILE="$STATE_DIR/mic.pid"
 MODFILE="$STATE_DIR/mic.module"
 LOGFILE="$STATE_DIR/mic.log"
@@ -36,7 +53,13 @@ LOGFILE="$STATE_DIR/mic.log"
 SOURCE=mic
 RATE=48000
 CHANNELS=1
-SOURCE_NAME=bridge_mic
+# The sink is what we create; the monitor of it is what applications record
+# from. Naming the sink bridge_mic keeps the recording device bridge_mic.monitor.
+SINK_NAME=bridge_mic
+SOURCE_NAME="$SINK_NAME.monitor"
+# Small enough not to be felt in a call, large enough to absorb the bursts
+# the phone link delivers in.
+LATENCY_MS="${BRIDGE_MIC_LATENCY_MS:-50}"
 
 # getopts has no notion of long options, and --help is the first thing
 # anyone types, so translate it before the loop rather than exiting 2 on it.
@@ -58,9 +81,24 @@ mkdir -p "$STATE_DIR"
 
 running() {
     [ -f "$PIDFILE" ] || return 1
-    local p
-    p="$(cat "$PIDFILE" 2>/dev/null)"
-    [ -n "$p" ] && [ -d "/proc/$p" ]
+    local p alive=0
+    for p in $(cat "$PIDFILE" 2>/dev/null); do
+        [ -n "$p" ] && [ -d "/proc/$p" ] && alive=1
+    done
+    [ "$alive" = 1 ]
+}
+
+# Both halves must be up. If only one is, the bridge is not merely degraded
+# -- a reader blocks forever on a pipe with no writer, which looks like a
+# hang rather than a failure, so treat a half-dead pipeline as dead.
+fully_running() {
+    [ -f "$PIDFILE" ] || return 1
+    local p n=0 alive=0
+    for p in $(cat "$PIDFILE" 2>/dev/null); do
+        n=$((n + 1))
+        [ -d "/proc/$p" ] && alive=$((alive + 1))
+    done
+    [ "$n" -gt 0 ] && [ "$alive" = "$n" ]
 }
 
 unload_module() {
@@ -70,19 +108,21 @@ unload_module() {
     fi
     # Belt and braces: an earlier run that was killed hard leaves the module
     # loaded with no state file, and loading a second one would give two
-    # sources with the same name.
+    # sinks with the same name.
     local idx
     idx=$(pactl list short modules 2>/dev/null \
-          | awk -v n="source_name=$SOURCE_NAME" '$2=="module-pipe-source" && $0 ~ n {print $1}')
+          | awk -v n="sink_name=$SINK_NAME" '$2=="module-null-sink" && $0 ~ n {print $1}')
     for i in $idx; do pactl unload-module "$i" 2>/dev/null; done
 }
 
 case "$CMD" in
 stop)
     if running; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null
+        for p in $(cat "$PIDFILE" 2>/dev/null); do kill "$p" 2>/dev/null; done
         sleep 0.3
-        running && kill -9 "$(cat "$PIDFILE")" 2>/dev/null
+        for p in $(cat "$PIDFILE" 2>/dev/null); do
+            [ -d "/proc/$p" ] && kill -9 "$p" 2>/dev/null
+        done
     fi
     rm -f "$PIDFILE"
     unload_module
@@ -91,10 +131,14 @@ stop)
     exit 0
     ;;
 status)
-    if running; then
-        echo "running (pid $(cat "$PIDFILE"))"
-        pactl list short sources 2>/dev/null | grep -F "$SOURCE_NAME" || true
+    if fully_running; then
+        echo "running (pids $(tr '\n' ' ' <"$PIDFILE"))"
+        pactl list short sources 2>/dev/null | grep -F "$SINK_NAME" || true
         exit 0
+    fi
+    if running; then
+        echo "half-dead: part of the pipeline exited -- run 'stop' then 'start'" >&2
+        exit 1
     fi
     echo "not running"
     exit 1
@@ -107,7 +151,7 @@ start) ;;
 esac
 
 if running; then
-    echo "already running (pid $(cat "$PIDFILE")); use 'stop' first" >&2
+    echo "already running (pids $(tr '\n' ' ' <"$PIDFILE")); use 'stop' first" >&2
     exit 1
 fi
 
@@ -121,37 +165,53 @@ if ! pactl info >/dev/null 2>&1; then
     exit 1
 fi
 
-mkdir -p "$SHARED_DIR" 2>/dev/null || {
-    echo "cannot create $SHARED_DIR -- set BRIDGE_SHARED_DIR to a path both" >&2
-    echo "this container and the Termux PulseAudio server can see" >&2
+mkdir -p "$STATE_DIR" 2>/dev/null || {
+    echo "cannot create $STATE_DIR" >&2
     exit 1
 }
 
 unload_module
 rm -f "$FIFO"
 
-# module-pipe-source creates the FIFO itself and fails if one is already
-# there, which is why it was removed above.
-MODID=$(pactl load-module module-pipe-source \
-            source_name="$SOURCE_NAME" \
-            file="$FIFO" \
-            format=s16le rate="$RATE" channels="$CHANNELS" 2>&1)
+# No spaces or parentheses in the description: pactl joins the module
+# arguments back into one string and re-splits on whitespace, so a quoted
+# value containing a space fails with nothing but "Module initialization
+# failed".
+MODID=$(pactl load-module module-null-sink \
+            sink_name="$SINK_NAME" \
+            rate="$RATE" channels="$CHANNELS" \
+            sink_properties=device.description=Phone_microphone_bridge 2>&1)
 if ! [[ "$MODID" =~ ^[0-9]+$ ]]; then
-    echo "failed to create the virtual source: $MODID" >&2
-    echo "(a path the PulseAudio server cannot see is the usual cause)" >&2
+    echo "failed to create the virtual device: $MODID" >&2
     exit 1
 fi
 echo "$MODID" > "$MODFILE"
 
+mkfifo "$FIFO" || { echo "cannot create $FIFO" >&2; unload_module; exit 1; }
+
+# pacat first: opening a FIFO for reading blocks until a writer appears, and
+# opening it for writing blocks until a reader does, so whichever starts
+# first simply waits. Starting the reader first means the very first samples
+# the phone sends have somewhere to go.
+pacat --playback --device="$SINK_NAME" \
+      --format=s16le --rate="$RATE" --channels="$CHANNELS" \
+      --latency-msec="$LATENCY_MS" \
+      --stream-name="phone microphone" \
+      <"$FIFO" >>"$LOGFILE" 2>&1 &
+PACAT_PID=$!
+
 "$CLIENT" mic -s "$SOURCE" "$RATE" "$CHANNELS" 0 "$FIFO" >>"$LOGFILE" 2>&1 </dev/null &
-echo $! > "$PIDFILE"
+CLIENT_PID=$!
+
+printf '%s\n%s\n' "$CLIENT_PID" "$PACAT_PID" > "$PIDFILE"
 
 sleep 1
-if ! running; then
+if ! fully_running; then
     echo "microphone feed failed to start; last log lines:" >&2
     tail -5 "$LOGFILE" >&2
+    kill "$CLIENT_PID" "$PACAT_PID" 2>/dev/null
     unload_module
-    rm -f "$PIDFILE"
+    rm -f "$PIDFILE" "$FIFO"
     exit 1
 fi
 
@@ -164,7 +224,8 @@ cat <<EOF
 microphone bridge running
   source:  $SOURCE ($RATE Hz, $CHANNELS ch, s16le)
   pulse:   $SOURCE_NAME (now the default source)
-  fifo:    $FIFO
+  latency: ${LATENCY_MS} ms
+  fifo:    $FIFO (container-local)
 
 Check it:
   parec --device=$SOURCE_NAME --file-format=wav /tmp/mic-test.wav

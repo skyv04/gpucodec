@@ -178,6 +178,22 @@ static int audio_source_for(const char *name) {
     return -1;
 }
 
+/*
+ * Camera rotation, clockwise. "auto" uses the sensor's mounting angle,
+ * which is what puts the picture upright: phone sensors are mounted to
+ * suit the industrial design, not the screen, so raw frames come out on
+ * their side. "none" is the escape hatch for anyone who wants exactly
+ * what the sensor saw.
+ */
+static int rotate_directive_for(const char *name) {
+    if (!strcmp(name, "auto")) return 0;
+    if (!strcmp(name, "none") || !strcmp(name, "0")) return 1;
+    if (!strcmp(name, "90"))   return 2;
+    if (!strcmp(name, "180"))  return 3;
+    if (!strcmp(name, "270"))  return 4;
+    return -1;
+}
+
 /* ------------------------------------------------------------ NAL parsing */
 
 /*
@@ -703,7 +719,7 @@ static void usage(const char *prog) {
         "  %s decode [-c CODEC] [<w> <h>] <in.bs> <out.yuv420>\n"
         "  %s info\n"
         "  %s log\n"
-        "  %s camera [-i INDEX] [--raw|--append] <w> <h> <fps> <frames> <out.y4m>\n"
+        "  %s camera [-i INDEX] [--rotate R] [--raw|--append] <w> <h> <fps> <frames> <out.y4m>\n"
         "  %s mic [-s SOURCE] <rate> <channels> <seconds> <out.pcm>\n"
         "\n"
         "  CODEC  h264 (default) | hevc | vp9 | av1\n"
@@ -715,6 +731,13 @@ static void usage(const char *prog) {
         "         offers every mode; \"info\" lists what each supports,\n"
         "         and an unsupported one is refused, not substituted.\n"
         "  INDEX  camera: 0 = rear (default), 1 = selfie; \"info\" lists them\n"
+        "  R      camera rotation, clockwise: auto (default) | none | 90 |\n"
+        "         180 | 270. Phone sensors are mounted sideways relative to\n"
+        "         the screen, so auto applies the mounting angle to put the\n"
+        "         picture upright; \"info\" prints each sensor's angle. <w>\n"
+        "         <h> still pick the sensor mode, so a quarter turn returns\n"
+        "         that many pixels with the dimensions swapped -- read the\n"
+        "         announced size, do not assume it.\n"
         "  SOURCE mic: mic (default) | voice | camcorder | unprocessed\n"
         "         voice adds the platform echo canceller and noise\n"
         "         suppressor, which is what you want when the far end is\n"
@@ -752,6 +775,7 @@ int main(int argc, char **argv) {
 
     const char *sub = argv[1];
     int ai = 2;
+    int cam_rotate = 0;   /* camera only; folded into s.codec's second byte */
 
     /* Flags between the subcommand and its positional args, in any order. */
     while (ai < argc && argv[ai][0] == '-' && argv[ai][1] != '\0'
@@ -790,6 +814,20 @@ int main(int argc, char **argv) {
             s.codec = atoi(argv[ai + 1]);
             if (s.codec < 0 || s.codec > 255) {
                 fprintf(stderr, "camera index must be 0..255\n");
+                return RC_USAGE;
+            }
+        } else if (!strcmp(argv[ai], "--rotate")) {
+            /*
+             * Camera rotation rides in bits 8-15 of the codec field, the
+             * same slot an encode uses for rate control -- a capture has no
+             * rate control, so no protocol change was needed. Applied in the
+             * camera block below rather than here, so -i and --rotate may be
+             * given in either order.
+             */
+            cam_rotate = rotate_directive_for(argv[ai + 1]);
+            if (cam_rotate < 0) {
+                fprintf(stderr, "unknown rotation '%s'"
+                        " (want auto, none, 90, 180 or 270)\n", argv[ai + 1]);
                 return RC_USAGE;
             }
         } else if (!strcmp(argv[ai], "-s")) {
@@ -851,6 +889,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "frame budget must be >= 0 (0 means unlimited)\n");
             return RC_USAGE;
         }
+        s.rc_mode = cam_rotate;   /* rides in bits 8-15, same slot as rate control */
     } else if (!strcmp(sub, "mic")) {
         if (rest != 4) {
             fprintf(stderr, "mic needs 4 args\n"); usage(argv[0]); return RC_USAGE;
