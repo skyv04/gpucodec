@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+#
+# Regression suite for the SELinux Hardware Bridge.
+#
+# Everything here runs against tools/mock-bridge.py, so it needs no phone, no
+# installed APK and no hardware codec -- which is the point: the client, the
+# framing and the ffmpeg encoders can all regress silently and the only way to
+# notice on a device is to look at a picture.  Fault injection (a bridge that
+# accepts a connection and then goes quiet, a bridge that refuses because it is
+# out of codec slots) is also impossible to arrange reliably on real hardware.
+#
+#   ./tools/selftest            run everything that is available
+#   FFMPEG=/path/to/ffmpeg ...  point at a build with the selinuxbridge codecs
+#
+# Exit status is 0 only if every test passed.
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+ROOT=$PWD
+PORT=${SELFTEST_PORT:-9413}
+STALL_PORT=$((PORT + 1))
+BUSY_PORT=$((PORT + 2))
+TMP=$(mktemp -d)
+FFMPEG=${FFMPEG:-$HOME/build/ffmpeg-agc1-install/bin/ffmpeg}
+FFPROBE=${FFPROBE:-$(dirname "$FFMPEG")/ffprobe}
+PIDS=()
+
+pass=0
+fail=0
+
+cleanup() {
+    for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+    rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass + 1)); }
+bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
+skip() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
+head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+require() {
+    command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 2; }
+}
+require python3
+require ffmpeg
+
+# ---------------------------------------------------------------- fixtures
+
+head_ "Building"
+if [ ! -x ./bridge_client ]; then
+    gcc -O2 -Wall -Wextra -o bridge_client bridge_client.c -lpthread \
+        || { echo "cannot build bridge_client" >&2; exit 2; }
+fi
+echo "  bridge_client ready"
+
+python3 tools/mock-bridge.py "$PORT" >"$TMP/mock.log" 2>&1 &
+PIDS+=($!)
+
+# A bridge that completes the handshake and then says nothing, which is what a
+# backgrounded app looks like from the client's side.
+cat >"$TMP/stall.py" <<'PY'
+import socket, struct, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(4)
+while True:
+    c, _ = s.accept()
+    try:
+        c.recv(24)
+        name = b"c2.mock.avc.encoder"
+        c.sendall(struct.pack(">ii", 0, len(name)) + name)
+        time.sleep(600)
+    except OSError:
+        pass
+PY
+
+# A bridge that refuses every session the way a slot-exhausted one does.
+cat >"$TMP/busy.py" <<'PY'
+import socket, struct, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(4)
+while True:
+    c, _ = s.accept()
+    msg = b"busy: all 3 hardware codec slots are in use"
+    c.recv(24)
+    c.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+    c.close()
+PY
+
+python3 "$TMP/stall.py" "$STALL_PORT" >/dev/null 2>&1 & PIDS+=($!)
+python3 "$TMP/busy.py"  "$BUSY_PORT"  >/dev/null 2>&1 & PIDS+=($!)
+sleep 2
+
+W=192; H=128; N=24
+ffmpeg -v error -y -f lavfi -i "testsrc=size=${W}x${H}:rate=30:duration=$((N / 30 + 1))" \
+    -frames:v $N -pix_fmt yuv420p -f rawvideo "$TMP/in.yuv"
+
+# ------------------------------------------------------------------ client
+
+head_ "Plane packing (JVM unit tests)"
+if command -v javac >/dev/null 2>&1; then
+    if out=$(./tools/test-i420 2>&1); then
+        n=$(echo "$out" | grep -c '^  PASS')
+        ok "$n I420 layout cases round-trip byte-exactly"
+    else
+        bad "I420 layout tests failed:"
+        echo "$out" | sed 's/^/      /'
+    fi
+else
+    skip "javac not available"
+fi
+
+head_ "bridge_client against the mock"
+
+if BRIDGE_PORT=$PORT ./bridge_client encode "$W" "$H" 30 1000000 \
+        "$TMP/in.yuv" "$TMP/out.h264" >/dev/null 2>&1; then
+    if [ -s "$TMP/out.h264" ]; then ok "encode produces a non-empty stream"
+    else bad "encode produced an empty stream"; fi
+else
+    bad "encode exited non-zero"
+fi
+
+got=$(ffprobe -v error -count_frames -select_streams v:0 \
+      -show_entries stream=nb_read_frames -of csv=p=0 "$TMP/out.h264" 2>/dev/null)
+if [ "$got" = "$N" ]; then ok "stream decodes to all $N frames"
+else bad "stream decodes to '$got' frames, expected $N"; fi
+
+if BRIDGE_PORT=$PORT ./bridge_client encode -c hevc "$W" "$H" 30 1000000 \
+        "$TMP/in.yuv" "$TMP/out.h265" >/dev/null 2>&1 && [ -s "$TMP/out.h265" ]; then
+    codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+            -of csv=p=0 "$TMP/out.h265" 2>/dev/null)
+    if [ "$codec" = "hevc" ]; then ok "-c hevc selects the HEVC component"
+    else bad "-c hevc produced codec '$codec'"; fi
+else
+    bad "-c hevc failed"
+fi
+
+# Streaming through a pipe is the case that used to buffer the whole stream.
+if cat "$TMP/in.yuv" | BRIDGE_PORT=$PORT ./bridge_client encode "$W" "$H" 30 1000000 - - \
+        >"$TMP/pipe.h264" 2>/dev/null && [ -s "$TMP/pipe.h264" ]; then
+    ok "encode streams over stdin/stdout"
+else
+    bad "encode over stdin/stdout failed"
+fi
+
+head_ "Failure handling"
+
+start=$(date +%s)
+BRIDGE_PORT=$STALL_PORT BRIDGE_TIMEOUT=3 BRIDGE_RETRIES=1 \
+    ./bridge_client encode "$W" "$H" 30 1000000 "$TMP/in.yuv" "$TMP/stall.out" \
+    >/dev/null 2>&1
+rc=$?; elapsed=$(( $(date +%s) - start ))
+if [ "$rc" -eq 3 ]; then ok "a stalled bridge exits 3 after ${elapsed}s instead of hanging"
+else bad "a stalled bridge exited $rc, expected 3"; fi
+
+start=$(date +%s)
+BRIDGE_PORT=$BUSY_PORT BRIDGE_TIMEOUT=10 BRIDGE_RETRIES=3 \
+    ./bridge_client encode "$W" "$H" 30 1000000 "$TMP/in.yuv" "$TMP/busy.out" \
+    >/dev/null 2>&1
+rc=$?; elapsed=$(( $(date +%s) - start ))
+if [ "$rc" -eq 1 ] && [ "$elapsed" -lt 5 ]; then
+    ok "a refusal exits 1 immediately (${elapsed}s) rather than retrying"
+else
+    bad "a refusal exited $rc after ${elapsed}s, expected 1 within 5s"
+fi
+
+BRIDGE_PORT=$((PORT + 90)) BRIDGE_TIMEOUT=3 \
+    ./bridge_client info >/dev/null 2>&1
+if [ $? -eq 1 ]; then ok "an unreachable bridge exits 1"
+else bad "an unreachable bridge did not exit 1"; fi
+
+./bridge_client bogus >/dev/null 2>&1
+if [ $? -eq 2 ]; then ok "a bad subcommand exits 2"
+else bad "a bad subcommand did not exit 2"; fi
+
+# Memory must not scale with stream length: the splitter is incremental.
+head_ "Memory"
+big=$TMP/big.yuv
+for _ in 1 2 3 4 5 6 7 8; do cat "$TMP/in.yuv"; done >"$big"
+peak() {
+    BRIDGE_PORT=$PORT ./bridge_client encode "$W" "$H" 30 1000000 "$1" "$TMP/p.out" \
+        >/dev/null 2>&1 &
+    local pid=$! hwm=0 cur
+    while kill -0 $pid 2>/dev/null; do
+        cur=$(awk '/VmHWM/{print $2}' /proc/$pid/status 2>/dev/null)
+        [ -n "${cur:-}" ] && [ "$cur" -gt "$hwm" ] && hwm=$cur
+        sleep 0.05
+    done
+    echo "$hwm"
+}
+small_kb=$(peak "$TMP/in.yuv")
+big_kb=$(peak "$big")
+if [ "$big_kb" -lt $((small_kb + 4096)) ]; then
+    ok "peak RSS is flat in stream length (${small_kb}K -> ${big_kb}K for 8x the input)"
+else
+    bad "peak RSS grew with the stream (${small_kb}K -> ${big_kb}K)"
+fi
+
+# ------------------------------------------------------------------ ffmpeg
+
+head_ "ffmpeg encoders"
+if [ -x "$FFMPEG" ]; then
+    export LD_LIBRARY_PATH=$(cd "$(dirname "$FFMPEG")/../lib" 2>/dev/null && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+fi
+if [ ! -x "$FFMPEG" ] || ! "$FFMPEG" -hide_banner -encoders 2>/dev/null \
+        | grep -q h264_selinuxbridge; then
+    skip "no ffmpeg build with the selinuxbridge encoders (set \$FFMPEG)"
+else
+    for c in h264 hevc; do
+        if "$FFMPEG" -v error -y -f lavfi \
+                -i "testsrc=size=${W}x${H}:rate=30:duration=1" -pix_fmt yuv420p \
+                -c:v ${c}_selinuxbridge -bridge_port "$PORT" "$TMP/ff_$c.mp4" \
+                >/dev/null 2>&1; then
+            n=$("$FFPROBE" -v error -count_frames -select_streams v:0 \
+                -show_entries stream=nb_read_frames -of csv=p=0 "$TMP/ff_$c.mp4" 2>/dev/null)
+            if [ "$n" = "30" ]; then ok "${c}_selinuxbridge writes a valid 30-frame mp4"
+            else bad "${c}_selinuxbridge mp4 reports '$n' frames"; fi
+
+            if "$FFMPEG" -v error -i "$TMP/ff_$c.mp4" -f null - >/dev/null 2>&1; then
+                ok "${c}_selinuxbridge mp4 decodes without errors"
+            else bad "${c}_selinuxbridge mp4 fails to decode"; fi
+        else
+            bad "${c}_selinuxbridge failed to encode"
+        fi
+    done
+
+    # Annex-B output has no global header, so the parameter sets have to stay
+    # inline or the stream is undecodable on its own.
+    if "$FFMPEG" -v error -y -f lavfi -i "testsrc=size=${W}x${H}:rate=30:duration=1" \
+            -pix_fmt yuv420p -c:v h264_selinuxbridge -bridge_port "$PORT" \
+            -f h264 "$TMP/ff.h264" >/dev/null 2>&1 \
+       && head -c 5 "$TMP/ff.h264" | od -An -tx1 | grep -q "00 00 00 01 67"; then
+        ok "raw Annex-B output starts with an inline SPS"
+    else
+        bad "raw Annex-B output is missing its inline parameter sets"
+    fi
+
+    if "$FFMPEG" -v error -y -f lavfi -i "testsrc=size=${W}x${H}:rate=30:duration=1" \
+            -pix_fmt yuv420p -c:v h264_selinuxbridge -bridge_port "$PORT" \
+            "$TMP/ts.mp4" 2>&1 | grep -qi "timestamps are unset"; then
+        bad "the muxer still reports unset timestamps"
+    else
+        ok "packet timestamps reach the muxer"
+    fi
+
+    start=$(date +%s)
+    "$FFMPEG" -v error -y -f lavfi -i "testsrc=size=${W}x${H}:rate=30:duration=1" \
+        -pix_fmt yuv420p -c:v h264_selinuxbridge -bridge_port "$STALL_PORT" \
+        -bridge_timeout 3 "$TMP/stall.mp4" >/dev/null 2>&1
+    rc=$?; elapsed=$(( $(date +%s) - start ))
+    if [ "$rc" -ne 0 ] && [ "$elapsed" -lt 30 ]; then
+        ok "a stalled bridge fails the encode in ${elapsed}s instead of hanging"
+    else
+        bad "a stalled bridge left ffmpeg running for ${elapsed}s (rc=$rc)"
+    fi
+fi
+
+head_ "Result"
+echo "  $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

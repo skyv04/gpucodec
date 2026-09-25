@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+#
+# Unit tests for I420.java on a plain JVM.
+#
+# The plane packing is the one piece of the bridge that can be completely wrong
+# while every observable signal still looks healthy: frame counts match, the
+# stream decodes, bitrate is sane and luma PSNR is fine -- only the colour is
+# destroyed.  It is also the piece that depends on layouts (semi-planar chroma,
+# padded row strides, crop rectangles) the device happens to choose, so it is
+# worth pinning down here rather than discovering on hardware.
+#
+# Stubs of android.media.Image and android.graphics.Rect stand in for the
+# framework, which is enough because I420 only ever touches getPlanes(),
+# getCropRect() and the three plane accessors.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+command -v javac >/dev/null || { echo "javac not found" >&2; exit 2; }
+
+mkdir -p "$TMP/src/android/media" "$TMP/src/android/graphics" \
+         "$TMP/src/com/selinuxbridge/app"
+
+cat >"$TMP/src/android/graphics/Rect.java" <<'JAVA'
+package android.graphics;
+public class Rect {
+    public int left, top, right, bottom;
+    public Rect(int l, int t, int r, int b) { left=l; top=t; right=r; bottom=b; }
+    public int width() { return right - left; }
+    public int height() { return bottom - top; }
+}
+JAVA
+
+cat >"$TMP/src/android/media/Image.java" <<'JAVA'
+package android.media;
+import android.graphics.Rect;
+import java.nio.ByteBuffer;
+public abstract class Image {
+    public abstract static class Plane {
+        public abstract ByteBuffer getBuffer();
+        public abstract int getRowStride();
+        public abstract int getPixelStride();
+    }
+    public abstract Plane[] getPlanes();
+    public abstract Rect getCropRect();
+}
+JAVA
+
+cp app/src/main/java/com/selinuxbridge/app/I420.java "$TMP/src/com/selinuxbridge/app/"
+
+cat >"$TMP/src/Test.java" <<'JAVA'
+import android.graphics.Rect;
+import android.media.Image;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.util.Random;
+
+public class Test {
+    static int pass = 0, fail = 0;
+
+    static void ok(String m)  { System.out.println("  PASS " + m); pass++; }
+    static void bad(String m) { System.out.println("  FAIL " + m); fail++; }
+
+    static class P extends Image.Plane {
+        final ByteBuffer b; final int rs, ps;
+        P(ByteBuffer b, int rs, int ps) { this.b = b; this.rs = rs; this.ps = ps; }
+        public ByteBuffer getBuffer()  { return b; }
+        public int getRowStride()      { return rs; }
+        public int getPixelStride()    { return ps; }
+    }
+
+    static class Img extends Image {
+        final Plane[] p; final Rect crop;
+        Img(Plane[] p, Rect crop) { this.p = p; this.crop = crop; }
+        public Plane[] getPlanes()  { return p; }
+        public Rect getCropRect()   { return crop; }
+    }
+
+    /** Planar I420 with an arbitrary row stride and slice height. */
+    static Img planar(int w, int h, int stride, int sliceH) {
+        int cw = (w + 1) / 2, ch = (h + 1) / 2;
+        int cStride = stride / 2, cSliceH = sliceH / 2;
+        ByteBuffer y = ByteBuffer.allocate(stride * sliceH);
+        ByteBuffer u = ByteBuffer.allocate(cStride * cSliceH);
+        ByteBuffer v = ByteBuffer.allocate(cStride * cSliceH);
+        return new Img(new Image.Plane[]{ new P(y, stride, 1),
+                                    new P(u, cStride, 1),
+                                    new P(v, cStride, 1) },
+                       new Rect(0, 0, w, h));
+    }
+
+    /** Semi-planar NV12: U and V alias one region, pixel stride 2. */
+    static Img semiPlanar(int w, int h, int stride, int sliceH) {
+        ByteBuffer y  = ByteBuffer.allocate(stride * sliceH);
+        byte[] uvBack = new byte[stride * ((h + 1) / 2)];
+        ByteBuffer u = ByteBuffer.wrap(uvBack);
+        ByteBuffer v = ByteBuffer.wrap(uvBack);
+        v.position(1); v = v.slice();
+        return new Img(new Image.Plane[]{ new P(y, stride, 1),
+                                    new P(u, stride, 2),
+                                    new P(v, stride, 2) },
+                       new Rect(0, 0, w, h));
+    }
+
+    static byte[] source(int w, int h) {
+        int cw = (w + 1) / 2, ch = (h + 1) / 2;
+        byte[] s = new byte[w * h + 2 * cw * ch];
+        Random r = new Random(7);
+        r.nextBytes(s);
+        return s;
+    }
+
+    static Method m(String name, Class<?>... args) throws Exception {
+        Class<?> c = Class.forName("com.selinuxbridge.app.I420");
+        Method mm = c.getDeclaredMethod(name, args);
+        mm.setAccessible(true);
+        return mm;
+    }
+
+    /* A round trip is the real contract: what goes into an input image in the
+     * device's layout must come back byte-identical from an output image in
+     * that same layout. */
+    static void roundTrip(String label, Img img, int w, int h) throws Exception {
+        byte[] src = source(w, h);
+        m("fill", Image.class, byte[].class, int.class, int.class)
+            .invoke(null, img, src, w, h);
+        byte[] back = (byte[]) m("toI420", Image.class).invoke(null, img);
+        if (java.util.Arrays.equals(src, back)) ok(label);
+        else {
+            int first = -1;
+            for (int i = 0; i < Math.min(src.length, back.length); i++)
+                if (src[i] != back[i]) { first = i; break; }
+            bad(label + " (len " + src.length + " vs " + back.length
+                + ", first difference at " + first + ")");
+        }
+    }
+
+    public static void main(String[] a) throws Exception {
+        System.out.println("I420 plane packing");
+
+        roundTrip("planar, stride == width",            planar(64, 48, 64, 48), 64, 48);
+        roundTrip("planar, padded row stride",          planar(60, 48, 64, 48), 60, 48);
+        roundTrip("planar, padded slice height",        planar(64, 44, 64, 48), 64, 44);
+        roundTrip("planar, 1080p-style 1088 slice",     planar(1920, 1080, 1920, 1088), 1920, 1080);
+        roundTrip("semi-planar NV12, stride == width",  semiPlanar(64, 48, 64, 48), 64, 48);
+        roundTrip("semi-planar NV12, padded stride",    semiPlanar(60, 48, 64, 48), 60, 48);
+        roundTrip("semi-planar NV12, 1080p",            semiPlanar(1920, 1080, 1920, 1088), 1920, 1080);
+        roundTrip("odd dimensions",                     planar(65, 33, 80, 48), 65, 33);
+
+        /* U and V must not be confused with one another: a swap survives a
+         * round trip through a symmetric layout, so check the bytes land in
+         * the plane they were addressed to. */
+        int w = 8, h = 8, cw = 4, ch = 4;
+        Img img = planar(w, h, w, h);
+        byte[] src = new byte[w * h + 2 * cw * ch];
+        java.util.Arrays.fill(src, 0, w * h, (byte) 10);
+        java.util.Arrays.fill(src, w * h, w * h + cw * ch, (byte) 20);
+        java.util.Arrays.fill(src, w * h + cw * ch, src.length, (byte) 30);
+        m("fill", Image.class, byte[].class, int.class, int.class)
+            .invoke(null, img, src, w, h);
+        boolean uOk = img.getPlanes()[1].getBuffer().get(0) == 20;
+        boolean vOk = img.getPlanes()[2].getBuffer().get(0) == 30;
+        if (uOk && vOk) ok("U and V reach their own planes");
+        else bad("U/V swapped (u=" + img.getPlanes()[1].getBuffer().get(0)
+                 + " v=" + img.getPlanes()[2].getBuffer().get(0) + ")");
+
+        /* Decoders commonly report a crop rectangle smaller than the aligned
+         * buffer; output must follow the crop, not the buffer. */
+        Img cropped = new Img(planar(64, 64, 64, 64).getPlanes(), new Rect(0, 0, 60, 44));
+        byte[] out = (byte[]) m("toI420", Image.class).invoke(null, cropped);
+        int expect = 60 * 44 + 2 * 30 * 22;
+        if (out.length == expect) ok("crop rectangle drives the output size");
+        else bad("crop ignored (" + out.length + " != " + expect + ")");
+
+        System.out.println("\n  " + pass + " passed, " + fail + " failed");
+        System.exit(fail == 0 ? 0 : 1);
+    }
+}
+JAVA
+
+javac -nowarn -d "$TMP/classes" -sourcepath "$TMP/src" \
+      "$TMP/src/Test.java" "$TMP/src/com/selinuxbridge/app/I420.java"
+java -cp "$TMP/classes" Test

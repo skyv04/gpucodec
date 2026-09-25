@@ -9,14 +9,26 @@
  * See README.md for full context and the verified test transcript.
  *
  * Usage:
- *   bridge_client encode <width> <height> <fps> <bitrate> <in.yuv420> <out.h264>
- *   bridge_client decode <width> <height> <in.h264> <out.yuv420>
+ *   bridge_client encode [-c CODEC] <w> <h> <fps> <bitrate> <in.yuv420> <out.bs>
+ *   bridge_client decode [-c CODEC] <w> <h> <in.bs> <out.yuv420>
  *   bridge_client info
+ *   bridge_client log
  *
- * Wire protocol v2, matching BridgeService.java exactly (see that file for
- * the authoritative spec): big-endian ints, mode/width/height/fps/bitrate
- * handshake, then a status reply carrying either the selected codec name
- * (success) or an error message (failure), then length-prefixed chunks
+ *   CODEC is one of h264 (default), hevc, vp9, av1.
+ *   "-" as a filename means stdin/stdout.
+ *
+ * Environment:
+ *   BRIDGE_TIMEOUT   seconds of socket inactivity before giving up (default 30)
+ *   BRIDGE_RETRIES   retries after a timeout, for seekable files (default 1)
+ *   BRIDGE_PORT      bridge port (default 7878)
+ *
+ * Exit codes:
+ *   0 ok   1 error   2 usage   3 timed out (bridge stalled / app throttled)
+ *
+ * Wire protocol v3, matching BridgeService.java exactly (see that file for
+ * the authoritative spec): big-endian ints, mode/width/height/fps/bitrate/
+ * codec handshake, then a status reply carrying either the selected codec
+ * name (success) or an error message (failure), then length-prefixed chunks
  * each direction, -1 length = EOS.
  */
 #include <arpa/inet.h>
@@ -29,13 +41,52 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
+
+#define RC_OK 0
+#define RC_ERR 1
+#define RC_USAGE 2
+#define RC_TIMEOUT 3
+
+/*
+ * Set whenever a socket operation fails specifically because SO_RCVTIMEO /
+ * SO_SNDTIMEO fired, so callers can distinguish "the bridge went quiet"
+ * (recoverable, worth retrying) from "the connection was closed" (fatal).
+ * Only ever written by a thread that is about to stop doing socket I/O,
+ * and read after that thread is joined, so a plain volatile int is enough.
+ */
+static volatile int io_timed_out = 0;
+
+static int timeout_secs(void) {
+    const char *e = getenv("BRIDGE_TIMEOUT");
+    int v = e ? atoi(e) : 0;
+    return v > 0 ? v : 30;
+}
+
+static int retry_count(void) {
+    const char *e = getenv("BRIDGE_RETRIES");
+    if (!e) return 1;
+    int v = atoi(e);
+    return v > 0 ? v : 0;
+}
+
+static int bridge_port(void) {
+    const char *e = getenv("BRIDGE_PORT");
+    int v = e ? atoi(e) : 0;
+    return v > 0 ? v : 7878;
+}
 
 static int write_all(int fd, const void *buf, size_t n) {
     const char *p = buf;
     while (n > 0) {
         ssize_t w = write(fd, p, n);
-        if (w <= 0) return -1;
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) io_timed_out = 1;
+            return -1;
+        }
+        if (w == 0) return -1;
         p += w;
         n -= (size_t)w;
     }
@@ -46,7 +97,12 @@ static int read_all(int fd, void *buf, size_t n) {
     char *p = buf;
     while (n > 0) {
         ssize_t r = read(fd, p, n);
-        if (r <= 0) return -1;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) io_timed_out = 1;
+            return -1;
+        }
+        if (r == 0) return -1; /* clean EOF, not a timeout */
         p += r;
         n -= (size_t)r;
     }
@@ -66,196 +122,305 @@ static int read_i32(int fd, int32_t *v) {
 }
 
 /* Reads a length-prefixed UTF-8 string reply (used for the codec-name /
- * error-message field of the handshake, and for the `info` payload). */
+ * error-message field of the handshake, and for the `info`/`log` payload). */
 static char *read_lp_string(int fd) {
     int32_t len;
     if (read_i32(fd, &len) != 0 || len < 0) return NULL;
     char *s = malloc((size_t)len + 1);
+    if (!s) return NULL;
     if (len > 0 && read_all(fd, s, (size_t)len) != 0) { free(s); return NULL; }
     s[len] = '\0';
     return s;
 }
+
+/* ---------------------------------------------------------------- codecs */
+
+static const struct { const char *name; int id; } CODECS[] = {
+    {"h264", 0}, {"avc", 0},
+    {"hevc", 1}, {"h265", 1},
+    {"vp9", 2},
+    {"av1", 3},
+    {NULL, 0}
+};
+
+static int codec_id_for(const char *name) {
+    for (int i = 0; CODECS[i].name; i++)
+        if (!strcmp(CODECS[i].name, name)) return CODECS[i].id;
+    return -1;
+}
+
+/* ------------------------------------------------------------ NAL parsing */
+
+/*
+ * Index of the next Annex-B start code at or after `off`, or -1.
+ * Checks the 4-byte form first at each position so a 00 00 00 01 code is
+ * reported at its true start rather than one byte in.
+ */
+static long sc_find(const uint8_t *b, size_t len, size_t off) {
+    for (size_t i = off; i + 3 <= len; i++) {
+        if (b[i] != 0 || b[i + 1] != 0) continue;
+        if (i + 4 <= len && b[i + 2] == 0 && b[i + 3] == 1) return (long)i;
+        if (b[i + 2] == 1) return (long)i;
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------- the writer */
 
 struct writer_args {
     int sock;
     int mode;
     int width, height;
     FILE *fin;
-    long sent; /* filled in by writer_thread */
+    long sent;   /* filled in by writer_thread */
+    int failed;  /* nonzero if a socket write failed */
 };
+
+static int send_unit(struct writer_args *a, const uint8_t *p, size_t n) {
+    if (write_i32(a->sock, (int32_t)n) != 0) return -1;
+    if (write_all(a->sock, p, n) != 0) return -1;
+    a->sent++;
+    return 0;
+}
 
 static void *writer_thread(void *arg) {
     struct writer_args *a = arg;
+
     if (a->mode == 0) {
-        size_t frame_size = (size_t)(a->width * a->height * 3 / 2);
+        size_t frame_size = (size_t)a->width * (size_t)a->height * 3 / 2;
         uint8_t *buf = malloc(frame_size);
+        if (!buf) { a->failed = 1; return NULL; }
         size_t r;
         while ((r = fread(buf, 1, frame_size, a->fin)) == frame_size) {
-            write_i32(a->sock, (int32_t)r);
-            write_all(a->sock, buf, r);
-            a->sent++;
+            if (send_unit(a, buf, r) != 0) { a->failed = 1; break; }
         }
-        write_i32(a->sock, -1); /* EOS */
         free(buf);
     } else {
-        /* Split Annex-B (00 00 00 01 / 00 00 01 start codes) into individual
+        /*
+         * Split Annex-B (00 00 00 01 / 00 00 01 start codes) into individual
          * NAL units, one per input buffer -- MediaCodec's decoder expects
          * access-unit framing, not one giant blob. Sending the whole
          * elementary stream as a single unit was tried first and produced
          * only a fraction of the expected output (observed: 110528 bytes
-         * instead of the expected 2592000) -- this fixes that. */
-        /* Read the whole elementary stream into memory. Grown dynamically
-         * (rather than fseek+ftell to size it up front) so this also works
-         * when fin is a pipe (e.g. piped straight from ffmpeg), which isn't
-         * seekable. */
-        size_t cap = 1 << 20, sz = 0;
+         * instead of the expected 2592000) -- this fixes that.
+         *
+         * This is a *streaming* splitter: it holds at most one NAL unit
+         * plus a read chunk in memory. The previous version slurped the
+         * entire elementary stream into RAM first, which put a hard ceiling
+         * on clip length (a long 4K stream would simply OOM the container)
+         * and defeated pipelining, since nothing was sent until the whole
+         * input had been read. It also works on non-seekable input (a pipe
+         * straight from ffmpeg), which is why it grows a buffer rather than
+         * using fseek/ftell.
+         */
+        size_t cap = 1u << 20, len = 0, cur = 0;
         uint8_t *buf = malloc(cap);
-        size_t r;
-        while ((r = fread(buf + sz, 1, cap - sz, a->fin)) > 0) {
-            sz += r;
-            if (sz == cap) { cap *= 2; buf = realloc(buf, cap); }
-        }
+        int have_cur = 0, eof = 0;
+        if (!buf) { a->failed = 1; return NULL; }
 
-        long i = 0;
-        while (i < sz) {
-            long start = i;
-            long nal_begin;
-            if (i + 4 <= sz && buf[i]==0 && buf[i+1]==0 && buf[i+2]==0 && buf[i+3]==1)
-                nal_begin = i + 4;
-            else if (i + 3 <= sz && buf[i]==0 && buf[i+1]==0 && buf[i+2]==1)
-                nal_begin = i + 3;
-            else { i++; continue; }
-
-            long j = nal_begin;
-            long next = sz;
-            while (j + 3 <= sz) {
-                if (buf[j]==0 && buf[j+1]==0 && (buf[j+2]==1 || (j+4<=sz && buf[j+2]==0 && buf[j+3]==1))) {
-                    next = j;
+        for (;;) {
+            if (!have_cur) {
+                long p = sc_find(buf, len, 0);
+                if (p >= 0) {
+                    /* Discard any leading garbage before the first NAL. */
+                    memmove(buf, buf + p, len - (size_t)p);
+                    len -= (size_t)p;
+                    cur = 0;
+                    have_cur = 1;
+                } else if (eof) {
                     break;
+                } else if (len > 3) {
+                    /* Keep only a possible split start code across the seam. */
+                    memmove(buf, buf + len - 3, 3);
+                    len = 3;
                 }
-                j++;
             }
 
-            long len = next - start;
-            write_i32(a->sock, (int32_t)len);
-            write_all(a->sock, buf + start, len);
-            a->sent++;
-            i = next;
+            if (have_cur) {
+                long next = sc_find(buf, len, cur + 3);
+                if (next >= 0) {
+                    if (send_unit(a, buf + cur, (size_t)next - cur) != 0) {
+                        a->failed = 1;
+                        break;
+                    }
+                    memmove(buf, buf + next, len - (size_t)next);
+                    len -= (size_t)next;
+                    cur = 0;
+                    continue; /* more may already be buffered */
+                }
+                if (eof) {
+                    if (len > cur && send_unit(a, buf + cur, len - cur) != 0)
+                        a->failed = 1;
+                    break;
+                }
+            }
+
+            if (len == cap) {
+                size_t ncap = cap * 2;
+                uint8_t *nb = realloc(buf, ncap);
+                if (!nb) { a->failed = 1; break; }
+                buf = nb;
+                cap = ncap;
+            }
+            size_t r = fread(buf + len, 1, cap - len, a->fin);
+            if (r == 0) eof = 1;
+            len += r;
         }
-        write_i32(a->sock, -1);
         free(buf);
     }
+
+    /* Always try to send EOS: without it the server waits forever. */
+    if (!a->failed && write_i32(a->sock, -1) != 0) a->failed = 1;
     return NULL;
 }
 
+/* ------------------------------------------------------------- connection */
+
 static int connect_bridge(void) {
+    int port = bridge_port();
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
+
     int one = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    /*
+     * Without these the client hangs forever if the bridge app stalls --
+     * which it demonstrably can, e.g. when Android throttles the app in the
+     * background, or (before the server-side semaphore fix) when Codec2's
+     * max-concurrent-instance cap made configure() block. An indefinite
+     * hang is the worst possible failure mode for something that gets
+     * called from scripts and pipelines, so bound every socket operation
+     * and report a distinct exit code when the bound is hit.
+     */
+    struct timeval tv;
+    tv.tv_sec = timeout_secs();
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(7878);
+    addr.sin_port = htons((uint16_t)port);
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         fprintf(stderr,
-            "connect to 127.0.0.1:7878 failed: %s\n"
+            "connect to 127.0.0.1:%d failed: %s\n"
             "Is the SELinux Hardware Bridge app installed and open on-screen?\n"
             "(It must stay open/foregrounded; it does not run as a background daemon.)\n",
-            strerror(errno));
+            port, strerror(errno));
         close(sock);
         return -1;
     }
     return sock;
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr,
-            "usage:\n"
-            "  %s encode <w> <h> <fps> <bitrate> <in.yuv420> <out.h264>\n"
-            "  %s decode <w> <h> <in.h264> <out.yuv420>\n"
-            "  %s info\n",
-            argv[0], argv[0], argv[0]);
-        return 2;
-    }
+static void timeout_hint(void) {
+    fprintf(stderr,
+        "bridge stalled: no data for %ds.\n"
+        "The app is probably backgrounded or being throttled by Android --\n"
+        "bring SELinux Hardware Bridge to the foreground and retry.\n"
+        "(raise the limit with BRIDGE_TIMEOUT=<seconds> if the clip is very large)\n",
+        timeout_secs());
+}
 
+/* ---------------------------------------------------------------- session */
+
+struct session {
     int mode;
-    int width = 0, height = 0, fps = 0, bitrate = 0;
-    const char *infile = NULL, *outfile = NULL;
+    int width, height, fps, bitrate;
+    int codec;
+    const char *infile, *outfile;
+};
 
-    if (!strcmp(argv[1], "encode")) {
-        if (argc != 8) { fprintf(stderr, "encode needs 6 args\n"); return 2; }
-        mode = 0;
-        width = atoi(argv[2]); height = atoi(argv[3]);
-        fps = atoi(argv[4]); bitrate = atoi(argv[5]);
-        infile = argv[6]; outfile = argv[7];
-    } else if (!strcmp(argv[1], "decode")) {
-        if (argc != 6) { fprintf(stderr, "decode needs 4 args\n"); return 2; }
-        mode = 1;
-        width = atoi(argv[2]); height = atoi(argv[3]);
-        infile = argv[4]; outfile = argv[5];
-    } else if (!strcmp(argv[1], "info")) {
-        mode = 2;
-    } else {
-        fprintf(stderr, "unknown mode '%s'\n", argv[1]);
-        return 2;
+/* Drains a text payload (modes 2 and 3) to stdout. */
+static int run_text_session(int sock) {
+    for (;;) {
+        int32_t olen;
+        if (read_i32(sock, &olen) != 0) {
+            if (io_timed_out) return RC_TIMEOUT;
+            break;
+        }
+        if (olen < 0) break;
+        if (olen > 0) {
+            char *buf = malloc((size_t)olen + 1);
+            if (!buf) return RC_ERR;
+            if (read_all(sock, buf, (size_t)olen) != 0) {
+                free(buf);
+                return io_timed_out ? RC_TIMEOUT : RC_ERR;
+            }
+            buf[olen] = '\0';
+            fputs(buf, stdout);
+            free(buf);
+        }
     }
+    fflush(stdout);
+    return RC_OK;
+}
+
+static int run_session(const struct session *s) {
+    io_timed_out = 0;
 
     int sock = connect_bridge();
-    if (sock < 0) return 1;
+    if (sock < 0) return RC_ERR;
 
-    write_i32(sock, mode);
-    write_i32(sock, width);
-    write_i32(sock, height);
-    write_i32(sock, fps);
-    write_i32(sock, bitrate);
+    if (write_i32(sock, s->mode) != 0 ||
+        write_i32(sock, s->width) != 0 ||
+        write_i32(sock, s->height) != 0 ||
+        write_i32(sock, s->fps) != 0 ||
+        write_i32(sock, s->bitrate) != 0 ||
+        write_i32(sock, s->codec) != 0) {
+        fprintf(stderr, "failed to send handshake\n");
+        close(sock);
+        return io_timed_out ? RC_TIMEOUT : RC_ERR;
+    }
 
     int32_t status;
     if (read_i32(sock, &status) != 0) {
+        if (io_timed_out) { timeout_hint(); close(sock); return RC_TIMEOUT; }
         fprintf(stderr, "lost connection during handshake\n");
-        return 1;
+        close(sock);
+        return RC_ERR;
     }
+
     char *reply = read_lp_string(sock);
     if (status != 0) {
         fprintf(stderr, "server rejected request: %s\n", reply ? reply : "(no message)");
         free(reply);
         close(sock);
-        return 1;
+        return RC_ERR;
     }
-    if (mode == 2) {
+    if (s->mode == 2 || s->mode == 3) {
         fprintf(stderr, "connected (bridge is alive)\n");
     } else {
         fprintf(stderr, "handshake ok, codec selected on-device: %s\n", reply ? reply : "?");
     }
     free(reply);
 
-    if (mode == 2) {
-        int32_t olen;
-        for (;;) {
-            if (read_i32(sock, &olen) != 0) break;
-            if (olen < 0) break;
-            char *buf = malloc((size_t)olen + 1);
-            if (olen > 0) read_all(sock, buf, (size_t)olen);
-            buf[olen] = '\0';
-            fputs(buf, stdout);
-            free(buf);
-        }
+    if (s->mode == 2 || s->mode == 3) {
+        int rc = run_text_session(sock);
+        if (rc == RC_TIMEOUT) timeout_hint();
         close(sock);
-        return 0;
+        return rc;
     }
 
     /* "-" means stdin/stdout, mirroring the agc-* tool conventions, so this
      * can be piped straight from/to ffmpeg without touching a temp file. */
-    FILE *fin = !strcmp(infile, "-") ? stdin : fopen(infile, "rb");
-    FILE *fout = !strcmp(outfile, "-") ? stdout : fopen(outfile, "wb");
-    if (!fin || !fout) { perror("fopen"); return 1; }
+    FILE *fin = !strcmp(s->infile, "-") ? stdin : fopen(s->infile, "rb");
+    if (!fin) { perror(s->infile); close(sock); return RC_ERR; }
+    FILE *fout = !strcmp(s->outfile, "-") ? stdout : fopen(s->outfile, "wb");
+    if (!fout) {
+        perror(s->outfile);
+        if (fin != stdin) fclose(fin);
+        close(sock);
+        return RC_ERR;
+    }
 
-    struct writer_args wargs = { .sock = sock, .mode = mode,
-                                  .width = width, .height = height, .fin = fin };
+    struct writer_args wargs = { .sock = sock, .mode = s->mode,
+                                 .width = s->width, .height = s->height,
+                                 .fin = fin, .sent = 0, .failed = 0 };
     pthread_t writer;
     /*
      * MediaCodec has algorithmic lookahead: it can accept several input
@@ -271,26 +436,138 @@ int main(int argc, char **argv) {
     pthread_create(&writer, NULL, writer_thread, &wargs);
 
     long got = 0;
+    int rc = RC_OK;
     for (;;) {
         int32_t olen;
         if (read_i32(sock, &olen) != 0) {
-            fprintf(stderr, "connection dropped mid-stream (bridge app closed/killed?)\n");
+            if (io_timed_out) {
+                timeout_hint();
+                rc = RC_TIMEOUT;
+            } else {
+                fprintf(stderr, "connection dropped mid-stream (bridge app closed/killed?)\n");
+                rc = RC_ERR;
+            }
             break;
         }
         if (olen < 0) break;
         if (olen > 0) {
-            uint8_t *ob = malloc(olen);
-            read_all(sock, ob, olen);
-            fwrite(ob, 1, olen, fout);
+            uint8_t *ob = malloc((size_t)olen);
+            if (!ob) { rc = RC_ERR; break; }
+            if (read_all(sock, ob, (size_t)olen) != 0) {
+                free(ob);
+                rc = io_timed_out ? RC_TIMEOUT : RC_ERR;
+                if (rc == RC_TIMEOUT) timeout_hint();
+                break;
+            }
+            fwrite(ob, 1, (size_t)olen, fout);
             free(ob);
             got++;
         }
     }
 
+    /*
+     * Shut the socket down before joining: if we bailed out on a timeout the
+     * writer may still be blocked in write(), and without this the join
+     * would reintroduce exactly the indefinite hang this change removes.
+     */
+    if (rc != RC_OK) shutdown(sock, SHUT_RDWR);
     pthread_join(writer, NULL);
+
+    if (rc == RC_OK && wargs.failed) {
+        fprintf(stderr, "input stream to bridge failed\n");
+        rc = io_timed_out ? RC_TIMEOUT : RC_ERR;
+    }
+
     fprintf(stderr, "done: sent=%ld units, received=%ld units\n", wargs.sent, got);
-    fclose(fin);
-    fclose(fout);
+    fflush(fout);
+    if (fin != stdin) fclose(fin);
+    if (fout != stdout) fclose(fout);
     close(sock);
-    return 0;
+    return rc;
+}
+
+/* ------------------------------------------------------------------- main */
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "usage:\n"
+        "  %s encode [-c CODEC] <w> <h> <fps> <bitrate> <in.yuv420> <out.bs>\n"
+        "  %s decode [-c CODEC] <w> <h> <in.bs> <out.yuv420>\n"
+        "  %s info\n"
+        "  %s log\n"
+        "\n"
+        "  CODEC  h264 (default) | hevc | vp9 | av1\n"
+        "  \"-\"    as a filename means stdin/stdout\n"
+        "\n"
+        "env: BRIDGE_TIMEOUT=%d  BRIDGE_RETRIES=%d  BRIDGE_PORT=%d\n",
+        prog, prog, prog, prog, timeout_secs(), retry_count(), bridge_port());
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { usage(argv[0]); return RC_USAGE; }
+
+    struct session s;
+    memset(&s, 0, sizeof(s));
+    s.codec = 0;
+
+    const char *sub = argv[1];
+    int ai = 2;
+
+    /* Optional "-c CODEC" directly after the subcommand. */
+    if (argc >= 4 && !strcmp(argv[2], "-c")) {
+        s.codec = codec_id_for(argv[3]);
+        if (s.codec < 0) {
+            fprintf(stderr, "unknown codec '%s' (want h264, hevc, vp9 or av1)\n", argv[3]);
+            return RC_USAGE;
+        }
+        ai = 4;
+    }
+    int rest = argc - ai;
+
+    if (!strcmp(sub, "encode")) {
+        if (rest != 6) { fprintf(stderr, "encode needs 6 args\n"); usage(argv[0]); return RC_USAGE; }
+        s.mode = 0;
+        s.width = atoi(argv[ai]); s.height = atoi(argv[ai + 1]);
+        s.fps = atoi(argv[ai + 2]); s.bitrate = atoi(argv[ai + 3]);
+        s.infile = argv[ai + 4]; s.outfile = argv[ai + 5];
+    } else if (!strcmp(sub, "decode")) {
+        if (rest != 4) { fprintf(stderr, "decode needs 4 args\n"); usage(argv[0]); return RC_USAGE; }
+        s.mode = 1;
+        s.width = atoi(argv[ai]); s.height = atoi(argv[ai + 1]);
+        s.infile = argv[ai + 2]; s.outfile = argv[ai + 3];
+    } else if (!strcmp(sub, "info")) {
+        s.mode = 2;
+    } else if (!strcmp(sub, "log")) {
+        s.mode = 3;
+    } else {
+        fprintf(stderr, "unknown mode '%s'\n", sub);
+        usage(argv[0]);
+        return RC_USAGE;
+    }
+
+    if ((s.mode == 0 || s.mode == 1) && (s.width <= 0 || s.height <= 0)) {
+        fprintf(stderr, "width and height must be positive\n");
+        return RC_USAGE;
+    }
+
+    /*
+     * A timeout is the one failure worth retrying automatically: the stall
+     * observed during stress testing was transient (one hang in ~80
+     * sessions, and the identical command then ran normally). Only retry
+     * when the streams are real files -- stdin cannot be rewound, so a
+     * retry there would silently produce truncated output.
+     */
+    int retries = retry_count();
+    int streaming_stdio = (s.mode == 0 || s.mode == 1) &&
+                          (!strcmp(s.infile, "-") || !strcmp(s.outfile, "-"));
+    if (streaming_stdio) retries = 0;
+
+    int rc = RC_ERR;
+    for (int attempt = 0; attempt <= retries; attempt++) {
+        if (attempt > 0)
+            fprintf(stderr, "retrying (attempt %d of %d)...\n", attempt + 1, retries + 1);
+        rc = run_session(&s);
+        if (rc != RC_TIMEOUT) break;
+    }
+    return rc;
 }

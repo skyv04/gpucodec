@@ -18,7 +18,24 @@ SDK="${ANDROID_SDK_ROOT:-/opt/Android/sdk}"
 BT_NATIVE="${BT_NATIVE:-$SDK/build-tools/34.0.0}"      # aapt2/zipalign (arch-native)
 BT_JAVA="${BT_JAVA:-$SDK/build-tools/34.0.0-2}"        # d8.jar/apksigner.jar (arch-agnostic)
 PLATFORM_JAR="${PLATFORM_JAR:-$SDK/platforms/android-34/android.jar}"
-KEYSTORE="${KEYSTORE:-build/debug.keystore}"
+
+# The signing key lives OUTSIDE build/ on purpose. It used to be at
+# build/debug.keystore, which `rm -rf build` below destroyed on every run,
+# so each rebuild produced an APK with a different signing identity and
+# Android refused to install it over the previous one ("App not installed"),
+# forcing an uninstall and losing app state. Keeping it in keystore/ makes
+# rebuilds true in-place updates. The directory is gitignored: this is a
+# local debug key, never a release key, and must not be committed.
+KEYSTORE="${KEYSTORE:-keystore/selinux-bridge.keystore}"
+
+# Migrate a key from the old throwaway location BEFORE build/ is wiped, so
+# an already-installed APK keeps updating in place instead of needing an
+# uninstall (Android rejects an update signed by a different key).
+mkdir -p "$(dirname "$KEYSTORE")"
+if [ ! -f "$KEYSTORE" ] && [ -f build/debug.keystore ]; then
+  echo "migrating signing key out of build/ so rebuilds stop changing identity"
+  cp build/debug.keystore "$KEYSTORE"
+fi
 
 rm -rf build
 mkdir -p build/res-compiled build/gen build/classes build/dex build/apk_unsigned build/apk_final
@@ -47,11 +64,12 @@ cp build/apk_unsigned/base.apk build/apk_unsigned/full.apk
 (cd build/dex && zip -q ../apk_unsigned/full.apk classes.dex)
 "$BT_NATIVE/zipalign" -f -p 4 build/apk_unsigned/full.apk build/apk_unsigned/aligned.apk
 
-echo "[6/7] signing (generating a throwaway debug keystore if needed)"
+echo "[6/7] signing"
 if [ ! -f "$KEYSTORE" ]; then
+  echo "      no keystore at $KEYSTORE, generating a persistent debug key"
   keytool -genkeypair -v -keystore "$KEYSTORE" -storepass android -keypass android \
     -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
-    -dname "CN=gpucodec,O=gpucodec,C=US"
+    -dname "CN=selinux-bridge,O=selinux-bridge,C=US"
 fi
 java -cp "$BT_JAVA/lib/apksigner.jar" com.android.apksigner.ApkSignerTool sign \
   --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \

@@ -2,29 +2,37 @@
 # bridge-status -- quick health check for the SELinux Hardware Bridge companion APK.
 #
 # Connects to the bridge's loopback socket and asks it for its `info`
-# diagnostic report (device model, Android version, and which AVC codecs
-# are hardware-backed). Prints a friendly message if the app isn't
-# reachable instead of a raw connect() error, since that's the single most
-# common failure mode (app not open / was killed by Android in the
-# background).
+# diagnostic report (device model, Android version, which codecs are
+# hardware-backed, and how many concurrent codec slots the device allows).
+# Prints a friendly message if the app isn't reachable instead of a raw
+# connect() error, since that's the single most common failure mode (app
+# not open / was killed by Android in the background).
+#
+# Usage: bridge-status [--log]
+#   --log  also dump the app's own bridge.log, which Android scoped storage
+#          otherwise hides from this side of the container.
 set -eu
 
 BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CLIENT="$BIN_DIR/bridge_client"
+PORT=${BRIDGE_PORT:-7878}
+
+want_log=0
+[ "${1:-}" = "--log" ] && want_log=1
 
 if [ ! -x "$CLIENT" ]; then
     echo "bridge-status: $CLIENT not found, run ./build.sh in selinux-bridge/ first" >&2
     exit 2
 fi
 
-if ! timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/7878' 2>/dev/null; then
-    cat >&2 <<'EOF'
-bridge-status: cannot reach 127.0.0.1:7878
+if ! timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
+    cat >&2 <<EOF
+bridge-status: cannot reach 127.0.0.1:$PORT
 
 The SELinux Hardware Bridge app is not running or not listening. This app must be
 open on-screen (or at least resident as a foreground service) -- it is not
 a background daemon that survives being swiped away. Open it from the app
-drawer, confirm its status line reads "Listening on 127.0.0.1:7878", then
+drawer, confirm its status line reads "Listening on 127.0.0.1:$PORT", then
 retry.
 EOF
     exit 1
@@ -32,3 +40,9 @@ fi
 
 echo "bridge-status: reachable, requesting diagnostics..." >&2
 "$CLIENT" info
+
+if [ "$want_log" = 1 ]; then
+    echo >&2
+    echo "bridge-status: requesting the app's own log..." >&2
+    "$CLIENT" log
+fi

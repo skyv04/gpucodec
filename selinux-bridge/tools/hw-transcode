@@ -11,18 +11,20 @@
 # offload, not a novel format.
 #
 # Usage:
-#   hw-transcode <in> <out.mp4> [width height fps bitrate]
+#   hw-transcode [-c h264|hevc] <in> <out.mp4> [width height fps bitrate]
 #
 # width/height/fps/bitrate default to the source's own, probed via ffprobe.
 set -eu
 
 usage() {
     cat >&2 <<'EOF'
-usage: hw-transcode <in> <out.mp4> [width height fps bitrate]
+usage: hw-transcode [-c CODEC] <in> <out.mp4> [width height fps bitrate]
 
 Decodes <in> with ffmpeg, re-encodes the raw frames on-device through the
 real Qualcomm hardware encoder (via the SELinux Hardware Bridge app), and remuxes
 the result to <out.mp4>.
+
+  -c CODEC   h264 (default) or hevc
 
 Requires the SELinux Hardware Bridge app (selinux-bridge/) to be installed and
 open on-screen. Run bridge-status first if unsure.
@@ -30,8 +32,21 @@ EOF
     exit 2
 }
 
+codec=h264
+if [ "${1:-}" = "-c" ]; then
+    [ $# -ge 2 ] || usage
+    codec=$2
+    shift 2
+fi
+
 [ $# -ge 2 ] || usage
 case $1 in -h|--help) usage ;; esac
+
+case $codec in
+    h264) container_fmt=h264 ;;
+    hevc|h265) codec=hevc; container_fmt=hevc ;;
+    *) echo "hw-transcode: -c must be h264 or hevc (got '$codec')" >&2; exit 2 ;;
+esac
 
 BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CLIENT="$BIN_DIR/bridge_client"
@@ -56,17 +71,33 @@ if [ -z "$fps" ]; then
                    -of csv=p=0 "$in" | awk -F/ '{ if ($2==0) print 30; else printf "%d", $1/$2 }')
 fi
 
-if ! timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/7878' 2>/dev/null; then
+PORT=${BRIDGE_PORT:-7878}
+if ! timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
     echo "hw-transcode: bridge app unreachable, is it open? (see bridge-status)" >&2
     exit 1
 fi
 
-tmp_h264=$(mktemp --suffix=.h264)
-trap 'rm -f "$tmp_h264"' EXIT
+tmp_bs=$(mktemp --suffix=".$container_fmt")
+trap 'rm -f "$tmp_bs"' EXIT
 
-echo "hw-transcode: ${width}x${height} @ ${fps}fps, bitrate=${bitrate} -> hardware encoder" >&2
+echo "hw-transcode: ${width}x${height} @ ${fps}fps, bitrate=${bitrate}, codec=${codec} -> hardware encoder" >&2
+
+# Piping straight from ffmpeg keeps memory flat regardless of clip length,
+# but it also means bridge_client cannot auto-retry a transient stall (stdin
+# is not rewindable), so a nonzero exit has to be surfaced rather than
+# swallowed by the pipeline.
+set +e
 ffmpeg -v error -i "$in" -f rawvideo -pix_fmt yuv420p -s "${width}x${height}" -r "$fps" - \
-  | "$CLIENT" encode "$width" "$height" "$fps" "$bitrate" - "$tmp_h264"
+  | "$CLIENT" encode -c "$codec" "$width" "$height" "$fps" "$bitrate" - "$tmp_bs"
+rc=$?
+set -e
+if [ "$rc" -eq 3 ]; then
+    echo "hw-transcode: the bridge stalled (app backgrounded?). Bring it to the front and retry." >&2
+    exit 3
+elif [ "$rc" -ne 0 ]; then
+    echo "hw-transcode: hardware encode failed (exit $rc)" >&2
+    exit "$rc"
+fi
 
-ffmpeg -v error -y -f h264 -r "$fps" -i "$tmp_h264" -c copy "$out"
+ffmpeg -v error -y -f "$container_fmt" -r "$fps" -i "$tmp_bs" -c copy "$out"
 echo "hw-transcode: wrote $out" >&2
