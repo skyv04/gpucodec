@@ -19,8 +19,10 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.LinearLayout;
+import android.widget.Button;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 /**
  * Launcher activity. Its real job is just to start BridgeService as a
@@ -214,19 +216,53 @@ public class MainActivity extends Activity {
         String warning = BridgeService.staleProcessWarning(this);
         if (warning == null) return null;
 
-        TextView tv = new TextView(this);
-        tv.setText("\u26A0  Restart needed\n\nA newer build is installed, but this process is "
-                 + "still running the previous one. Force-stop the app and reopen it "
-                 + "so the new code loads.");
-        tv.setTextColor(0xFFFFFFFF);
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
         int p = dp(16);
-        tv.setPadding(p, p, p, p);
+        box.setPadding(p, p, p, p);
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xFF8A3A12);
         bg.setCornerRadius(dp(14));
-        tv.setBackground(bg);
-        return tv;
+        box.setBackground(bg);
+
+        TextView tv = new TextView(this);
+        tv.setText("\u26A0  Restart needed\n\nA newer build is installed, but this process is "
+                 + "still running the previous one. Installing an APK does not reliably "
+                 + "restart a running service, and nothing else reloads the code.");
+        tv.setTextColor(0xFFFFFFFF);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        box.addView(tv);
+
+        Button restart = new Button(this);
+        restart.setText("Restart now");
+        restart.setAllCaps(false);
+        restart.setTextColor(0xFF8A3A12);
+        GradientDrawable btnBg = new GradientDrawable();
+        btnBg.setColor(0xFFFFFFFF);
+        btnBg.setCornerRadius(dp(10));
+        restart.setBackground(btnBg);
+        restart.setOnClickListener(v -> {
+            // Killing the process mid-transcode would abort somebody's stream
+            // with no warning, so refuse while any codec is in use.
+            int busy = BridgeService.activeSessions();
+            if (busy > 0) {
+                Toast.makeText(this, busy + " transcode(s) still running \u2014 "
+                        + "try again when the bridge is idle.", Toast.LENGTH_LONG).show();
+                return;
+            }
+            // The service is START_STICKY, so Android restarts it after the
+            // process dies, and that restart loads the new code. This is the
+            // only thing short of a force-stop that actually reloads classes.
+            Toast.makeText(this, "Restarting\u2026 reopen the app in a moment.",
+                    Toast.LENGTH_LONG).show();
+            new android.os.Handler(getMainLooper()).postDelayed(
+                    () -> System.exit(0), 600);
+        });
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(14);
+        box.addView(restart, blp);
+        return box;
     }
 
     private boolean isBatteryExempt() {

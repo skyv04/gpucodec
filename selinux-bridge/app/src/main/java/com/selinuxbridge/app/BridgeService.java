@@ -127,6 +127,11 @@ public class BridgeService extends Service {
     private static final int CODEC_SLOT_LIMIT = maxConcurrentInstances();
     private static final Semaphore CODEC_SLOTS = new Semaphore(CODEC_SLOT_LIMIT, true);
 
+    /** Sessions holding a codec right now. Used to refuse an unsafe restart. */
+    static int activeSessions() {
+        return CODEC_SLOT_LIMIT - CODEC_SLOTS.availablePermits();
+    }
+
     /**
      * How long a client will wait for a free codec slot before being told
      * the bridge is busy. Long enough to ride out a session that is about
