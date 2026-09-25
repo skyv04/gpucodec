@@ -9,11 +9,21 @@ pixels, and takes back a compressed stream.
 
 ## Why this exists
 
-On this device the hardware video block is permanently unreachable. The
-container is denied `/dev/dma_heap/*`, so Codec2 cannot allocate buffers, and
-the SELinux label on `app_process64` blocks the usual workarounds. Hardware
-encode and decode are simply not available, no matter how the software is
-configured.
+From inside the Termux/PRoot Debian container, the hardware video block is
+unreachable. The container is denied `/dev/dma_heap/*`, so Codec2 cannot
+allocate buffers, and the SELinux label on `app_process64` (`zygote_exec`)
+blocks the usual workarounds (the shell runs as `untrusted_app_27`, which
+cannot execute into it). Hardware encode and decode are simply not available
+from that shell, no matter how the software is configured — see
+`COPILOT-HANDOFF.md` §2.5l for the full investigation.
+
+That restriction belongs to the **shell's own app identity**, though, not to
+the device. A real, installed Android app gets a different identity (a real
+UID and SELinux app domain from Zygote), and normal apps use MediaCodec with
+no special permission at all. **`android-bridge/`** is a small APK that tests
+this directly: it exposes real hardware `MediaCodec` over a loopback socket so
+the Debian side can drive it. See `android-bridge/README.md` for the wire
+protocol, build instructions, and how to interpret the result.
 
 The GPU, by contrast, *is* reachable: `/dev/kgsl-3d0` is world-readable and
 Turnip drives it properly. So the question became whether a codec could be
@@ -556,6 +566,7 @@ works identically on a file and on stdin.
 | `cpu_sad.c` | CPU motion-search baseline used to decide against inter coding |
 | `agc_core.h` | the reusable, hardened GPU pipeline — see "Embedding AGC-1" |
 | `ffmpeg/` | `agc1`: AGC-1 as a real `libavcodec` codec for Shotcut/Blender |
+| `android-bridge/` | experimental APK exposing real hardware MediaCodec over loopback, to test whether a real app identity unlocks the hardware codec this container can't reach |
 
 ## Notes for anyone extending this
 
