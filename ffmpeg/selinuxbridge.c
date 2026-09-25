@@ -1050,7 +1050,7 @@ static const AVOption sb_options[] = {
       { .i64 = 0 }, 0, 2, VE, "rc_mode" },
     { "cbr", "constant bitrate; holds the requested -b:v",
       0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, VE, "rc_mode" },
-    { "vbr", "variable bitrate; -b:v is an average and may overshoot ~30%",
+    { "vbr", "variable bitrate; -b:v is an average, measured 27-206% over",
       0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, VE, "rc_mode" },
     { "cq",  "constant quality; uses -q:v (1-100) instead of -b:v",
       0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, VE, "rc_mode" },
