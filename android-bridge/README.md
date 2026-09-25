@@ -34,7 +34,7 @@ loopback TCP socket, so the Debian/PRoot side can drive it directly.
 | File | Purpose |
 |---|---|
 | `AndroidManifest.xml` | One activity, one foreground service. `INTERNET` permission only for the loopback socket. |
-| `app/src/main/java/com/gpucodec/bridge/MainActivity.java` | Launcher UI; starts the bridge service in the foreground so Android doesn't kill it. |
+| `app/src/main/java/com/gpucodec/bridge/MainActivity.java` | Launcher UI; starts the bridge service in the foreground so Android doesn't kill it. Everything is drawn programmatically (gradients, a small chip-logo icon, a pulsing "alive" status dot, a data-flow diagram) rather than a blank white screen — see screenshot note below. |
 | `app/src/main/java/com/gpucodec/bridge/BridgeService.java` | The actual bridge: `ServerSocket` on `127.0.0.1:7878`, wire protocol below, drives `android.media.MediaCodec` synchronously, explicitly preferring hardware (`c2.qti.*`) codec components, one thread per client so a crashed session doesn't take down the accept loop, and logs to a file (see below). |
 | `bridge_client.c` | Debian-side test client/CLI: connects over loopback, sends raw frames or a bitstream (from a file or a pipe), prints round-trip stats and the codec name actually used; also supports the `info` diagnostic request. |
 | `build.sh` | Rebuilds the signed APK from source using raw SDK command-line tools (`aapt2`, `javac`, `d8`, `apksigner`) — no gradle/network dependency. |
@@ -80,6 +80,13 @@ adb install -r android-bridge/build/apk_final/gpucodec-bridge.apk
 Launch the app once and leave it open (or in the recent-apps list — it runs
 as a foreground service with a persistent notification, so Android won't
 kill it). It listens on `127.0.0.1:7878` for as long as it's alive.
+
+The landing screen is a dark, gradient-themed dashboard rather than a blank
+white page: a chip-logo header, a pulsing green "listening" status card, a
+small data-flow diagram (`PRoot shell → Bridge :7878 → hardware codec`),
+and a short feature list. All of it is drawn with plain Java (canvas
+shapes, `GradientDrawable`) — no image assets or extra XML resources, so it
+doesn't touch `build.sh`'s resource-linking step at all.
 
 ## Wire protocol (v2)
 
@@ -136,6 +143,17 @@ cat /sdcard/Android/data/com.gpucodec.bridge/files/bridge.log
 
 and the `info` mode / `tools/bridge-status` gives a live summary without
 needing to read the log file at all for the common case.
+
+**Caveat, found while verifying this on-device**: on Android 11+ (this
+device is Android 17), `Android/data/<package>/` is scoped-storage-sandboxed
+and denies directory listing/reads from *other* apps/shells, including this
+one, even under `/sdcard` — `find /sdcard/Android/data/com.gpucodec.bridge`
+returns "Permission denied" from the Debian side. So `bridge.log` exists
+and is useful if you have a way to read it (a root shell, `adb shell run-as`,
+or the device's own Files app with "show system files"), but it is **not**
+actually readable from the Termux/PRoot shell as originally assumed. The
+`info` mode over the socket (verified working, see below) is the reliable
+adb-free diagnostic path in practice.
 
 ## Testing the bridge
 
@@ -223,15 +241,49 @@ hardened for everyday use rather than one-off validation:
   isn't just a raw protocol but something pastable into a normal workflow.
 
 This is a genuine breaking wire-protocol change (v1 servers/clients cannot
-talk to v2 clients/servers) — see "Wire protocol (v2)" above. **Status of
-this hardening as of this writing**: builds cleanly (`./build.sh`, APK +
-`bridge_client` both compile with no errors) and the manifest/signing are
-verified identical to the working v1 build (`targetSdkVersion=34`, same
-debug key). Re-running the full live encode/decode/info round trip against
-the *installed* v2 app is the next step once the updated APK is
-sideloaded (same physical-tap install step as the original v1 install —
-see "Installing" above) — check this file's git history / commit messages
-for whether that final on-device confirmation has been recorded yet.
+talk to v2 clients/servers) — see "Wire protocol (v2)" above.
+
+### Verified result (this device, this session, protocol v2)
+
+APK reinstalled (physical sideload tap, same install step as v1), reopened,
+then re-ran the full test matrix from the Debian/PRoot side:
+
+```
+$ ./bridge_client info
+connected (bridge is alive)
+GPUCodec Bridge diagnostics
+device: SM-F971U1 (qcom)
+android: 17 (sdk 37)
+
+AVC (H.264) codecs available:
+  decoder: c2.qti.avc.decoder [hardware]
+  decoder: c2.qti.avc.decoder.low_latency [hardware]
+  encoder: c2.qti.avc.encoder [hardware]
+  decoder: c2.android.avc.decoder
+  encoder: c2.android.avc.encoder
+  ... (software OMX.google.*/OMX.qcom.* entries omitted here)
+
+$ ./bridge_client encode 320 180 30 2000000 test.yuv420 out.h264
+handshake ok, codec selected on-device: c2.qti.avc.encoder
+done: sent=30 units, received=31 units
+
+$ ./bridge_client decode 320 180 out.h264 redecoded.yuv420
+handshake ok, codec selected on-device: c2.qti.avc.decoder
+done: sent=32 units, received=30 units
+
+$ ./tools/bridge-status         # health check, same info output as above
+$ ./tools/hw-transcode testsrc.mp4 hwout.mp4
+hw-transcode: 320x180 @ 30fps, bitrate=4000000 -> hardware encoder
+handshake ok, codec selected on-device: c2.qti.avc.encoder
+done: sent=30 units, received=31 units
+hw-transcode: wrote hwout.mp4      # a normal, playable .mp4
+```
+
+**Confirmed**: the v2 protocol correctly reports the real hardware codec
+component by name for both encode and decode, `bridge-status` and
+`hw-transcode` both work end-to-end against the live app, and the codec
+selection logic picked `c2.qti.*` over the available software alternatives
+exactly as designed.
 
 ## Why this isn't a Termux:API contribution
 
