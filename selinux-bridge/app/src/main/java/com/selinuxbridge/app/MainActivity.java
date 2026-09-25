@@ -10,7 +10,10 @@ import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -44,6 +47,9 @@ public class MainActivity extends Activity {
     private static final int TEXT_MAIN = Color.parseColor("#F1F5F9");
     private static final int TEXT_DIM = Color.parseColor("#94A3B8");
 
+    private TextView powerStatus;
+    private TextView powerAction;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -59,6 +65,8 @@ public class MainActivity extends Activity {
         root.addView(buildHeader());
         root.addView(spacer(24));
         root.addView(buildStatusCard());
+        root.addView(spacer(14));
+        root.addView(buildPowerCard());
         root.addView(spacer(28));
         root.addView(sectionTitle("How it works"));
         root.addView(spacer(12));
@@ -144,6 +152,92 @@ public class MainActivity extends Activity {
         card.addView(statusLine);
         card.addView(caption);
         return card;
+    }
+
+    /**
+     * Doze exemption (gap #4, mitigation 2).
+     *
+     * A foreground service is not immune to Doze on every OEM ROM, and this
+     * one is by design invisible for long stretches -- the Debian side may
+     * not talk to it for hours. Offering the exemption up front, with its
+     * current state visible, means the user does not have to discover
+     * Settings > Battery > Unrestricted after the first mysterious stall.
+     *
+     * The direct REQUEST_IGNORE_BATTERY_OPTIMIZATIONS dialog is tried first
+     * and falls back to the plain settings list, because some ROMs refuse
+     * the direct intent.
+     */
+    private View buildPowerCard() {
+        LinearLayout cardView = card();
+        cardView.setOrientation(LinearLayout.VERTICAL);
+
+        powerStatus = new TextView(this);
+        powerStatus.setTextColor(TEXT_MAIN);
+        powerStatus.setTypeface(powerStatus.getTypeface(), android.graphics.Typeface.BOLD);
+        powerStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+
+        TextView caption = new TextView(this);
+        caption.setText("Survives reboots and in-place updates automatically. A force-stop "
+                + "(swipe away from recents) still needs a manual launch \u2014 Android "
+                + "allows no way around that without root.");
+        caption.setTextColor(TEXT_DIM);
+        caption.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        caption.setPadding(0, dp(8), 0, 0);
+
+        powerAction = new TextView(this);
+        powerAction.setTextColor(ACCENT);
+        powerAction.setTypeface(powerAction.getTypeface(), android.graphics.Typeface.BOLD);
+        powerAction.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        powerAction.setPadding(0, dp(14), 0, 0);
+        powerAction.setOnClickListener(v -> requestBatteryExemption());
+
+        cardView.addView(powerStatus);
+        cardView.addView(caption);
+        cardView.addView(powerAction);
+        refreshPowerCard();
+        return cardView;
+    }
+
+    private boolean isBatteryExempt() {
+        PowerManager pm = getSystemService(PowerManager.class);
+        return pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
+    }
+
+    private void refreshPowerCard() {
+        if (powerStatus == null || powerAction == null) return;
+        if (isBatteryExempt()) {
+            powerStatus.setText("\u2713  Exempt from battery optimisation");
+            powerAction.setText("Review in system settings \u203A");
+        } else {
+            powerStatus.setText("\u26A0  Battery optimisation is active");
+            powerAction.setText("Allow the bridge to keep running \u203A");
+        }
+    }
+
+    private void requestBatteryExemption() {
+        if (!isBatteryExempt()) {
+            try {
+                startActivity(new Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + getPackageName())));
+                return;
+            } catch (Exception ignored) {
+                // Fall through to the settings list below.
+            }
+        }
+        try {
+            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+        } catch (Exception ignored) {
+            // No such settings screen on this ROM; nothing further to offer.
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // The exemption is granted in a system dialog, so the only chance to
+        // notice the change is on the way back into this activity.
+        refreshPowerCard();
     }
 
     private View featureRow(String glyph, int badgeColor, String title, String desc) {

@@ -1,9 +1,10 @@
 /*
- * SELinux Hardware Bridge — libavcodec encoder wrapper.
+ * SELinux Hardware Bridge — libavcodec encoder and decoder wrapper.
  *
  * Registers `h264_selinuxbridge` and `hevc_selinuxbridge` as real
- * libavcodec encoders that hand frames to Qualcomm's Codec2 hardware
- * encoder through the companion Android app (see selinux-bridge/README.md).
+ * libavcodec encoders *and* decoders that hand frames to Qualcomm's Codec2
+ * hardware block through the companion Android app (see
+ * selinux-bridge/README.md).
  *
  * Why this exists: the Termux/PRoot container is SELinux-denied
  * access to /dev/dma_heap, so it can never drive Codec2 directly and ffmpeg has no
@@ -16,6 +17,7 @@
  * surgery:
  *
  *     ffmpeg -i in.mp4 -c:v h264_selinuxbridge -b:v 4M out.mp4
+ *     ffmpeg -c:v h264_selinuxbridge -i in.mp4 -c:v rawvideo out.yuv
  *
  * These are registered against the existing AV_CODEC_ID_H264 /
  * AV_CODEC_ID_HEVC ids -- the bridge emits bit-exact standard streams, so
@@ -29,6 +31,7 @@
  * the design already proven in selinux-bridge/bridge_client.c.
  */
 #include <errno.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -40,7 +43,9 @@
 
 #include "avcodec.h"
 #include "codec_internal.h"
+#include "decode.h"
 #include "encode.h"
+#include "internal.h"
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/imgutils.h"
@@ -53,6 +58,13 @@
 typedef struct SBPacket {
     uint8_t *data;
     int size;
+    /*
+     * Protocol v4 format record. Decode sessions interleave these with the
+     * output frames so a client learns the stream's real dimensions without
+     * parsing the bitstream, and survives a mid-stream resolution change.
+     */
+    int is_format;
+    int fmt_w, fmt_h;
     struct SBPacket *next;
 } SBPacket;
 
@@ -64,6 +76,8 @@ typedef struct SBContext {
 
     int sock;
     int codec_id_wire;      /* 0 = h264, 1 = hevc */
+    int is_decoder;
+    int dec_w, dec_h;       /* dimensions of the last v4 format record */
     char codec_name[128];   /* component the device actually picked */
 
     pthread_t reader;
@@ -123,6 +137,42 @@ static int sb_pts_pop(SBContext *s, int64_t *pts)
     if (!s->pts_count)
         return 0;
     *pts = s->pts_q[s->pts_head];
+    s->pts_head = (s->pts_head + 1) % s->pts_cap;
+    s->pts_count--;
+    return 1;
+}
+
+/*
+ * Decoding is the one case where popping in submission order is wrong: the
+ * bridge hands frames back in *display* order while packets go in in decode
+ * order, so a stream with B-frames would get its timestamps permuted. The
+ * protocol carries no per-unit timestamp to hand back, but the smallest
+ * outstanding pts is by definition the one belonging to the next frame to be
+ * displayed, and the component's own reorder delay guarantees that pts has
+ * already been submitted by the time the frame appears. For a stream without
+ * B-frames this degenerates to plain FIFO order.
+ */
+static int sb_pts_pop_min(SBContext *s, int64_t *pts)
+{
+    int best = -1;
+
+    for (int i = 0; i < s->pts_count; i++) {
+        int idx = (s->pts_head + i) % s->pts_cap;
+        if (s->pts_q[idx] == AV_NOPTS_VALUE)
+            continue;
+        if (best < 0 || s->pts_q[idx] < s->pts_q[best])
+            best = idx;
+    }
+    if (best < 0)
+        return sb_pts_pop(s, pts);
+
+    *pts = s->pts_q[best];
+    /* Close the hole by sliding the entries ahead of it back one slot. */
+    while (best != s->pts_head) {
+        int prev = (best - 1 + s->pts_cap) % s->pts_cap;
+        s->pts_q[best] = s->pts_q[prev];
+        best = prev;
+    }
     s->pts_head = (s->pts_head + 1) % s->pts_cap;
     s->pts_count--;
     return 1;
@@ -196,6 +246,30 @@ static void *sb_reader_thread(void *arg)
             s->reader_error = 1;
             break;
         }
+        if (len == -2) {
+            /*
+             * Protocol v4 format record: two more int32s, then the stream
+             * continues. Queued rather than applied here so the dimension
+             * change lands in the output sequence at exactly the right
+             * point relative to the frames around it.
+             */
+            int32_t fw, fh;
+            if (sb_read_i32(s->sock, &fw) < 0 || sb_read_i32(s->sock, &fh) < 0) {
+                pthread_mutex_lock(&s->lock);
+                s->reader_error = 1;
+                break;
+            }
+            node = av_mallocz(sizeof(*node));
+            if (!node) {
+                pthread_mutex_lock(&s->lock);
+                s->reader_error = 1;
+                break;
+            }
+            node->is_format = 1;
+            node->fmt_w = fw;
+            node->fmt_h = fh;
+            goto enqueue;
+        }
         if (len < 0) {
             pthread_mutex_lock(&s->lock);
             break;
@@ -219,6 +293,7 @@ static void *sb_reader_thread(void *arg)
         }
         node->size = len;
 
+enqueue:
         pthread_mutex_lock(&s->lock);
         if (s->tail)
             s->tail->next = node;
@@ -290,18 +365,20 @@ static av_cold int sb_connect(AVCodecContext *avctx, SBContext *s)
 static void sb_scan_nals(const uint8_t *buf, int size, int hevc,
                          int *all_param_sets, int *is_key, int *ps_prefix);
 
-/* Encode-mode handshake: six int32s out, then status + component name back. */
+/* Handshake: six int32s out, then status + component name back. */
 static av_cold int sb_handshake(AVCodecContext *avctx, SBContext *s, int sock,
                                 int fps)
 {
     int32_t status, nlen;
     char msg[512];
+    const int mode = s->is_decoder ? 1 : 0;
 
-    if (sb_write_i32(sock, 0) < 0 ||
+    if (sb_write_i32(sock, mode) < 0 ||
         sb_write_i32(sock, avctx->width) < 0 ||
         sb_write_i32(sock, avctx->height) < 0 ||
-        sb_write_i32(sock, fps) < 0 ||
-        sb_write_i32(sock, avctx->bit_rate > 0 ? (int)avctx->bit_rate : 4000000) < 0 ||
+        sb_write_i32(sock, s->is_decoder ? 0 : fps) < 0 ||
+        sb_write_i32(sock, s->is_decoder ? 0
+                           : (avctx->bit_rate > 0 ? (int)avctx->bit_rate : 4000000)) < 0 ||
         sb_write_i32(sock, s->codec_id_wire) < 0) {
         av_log(avctx, AV_LOG_ERROR, "selinuxbridge: handshake write failed\n");
         return AVERROR(EIO);
@@ -493,7 +570,7 @@ static av_cold int sb_encode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static av_cold int sb_encode_close(AVCodecContext *avctx)
+static av_cold int sb_close(AVCodecContext *avctx)
 {
     SBContext *s = avctx->priv_data;
     SBPacket *node;
@@ -750,16 +827,211 @@ static int sb_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     return sb_collect(avctx, pkt, got_packet, frame == NULL);
 }
 
+/* ------------------------------------------------------------- decode */
+
+/*
+ * Decoding is the mirror image of the encode path and shares all of its
+ * plumbing: the same socket, the same reader thread, the same packet queue.
+ * The two differences are that the payloads travel the other way round --
+ * Annex-B access units in, tightly packed I420 out -- and that the output
+ * stream is punctuated by protocol-v4 format records, which is how the
+ * decoder learns the picture size without parsing the bitstream itself and
+ * how it survives a resolution change mid-stream.
+ *
+ * Input has to be Annex-B, so the registration below attaches the standard
+ * h264_mp4toannexb / hevc_mp4toannexb bitstream filters exactly as
+ * h264_mediacodec does; mp4/mov sources are therefore handled transparently.
+ */
+static av_cold int sb_decode_init(AVCodecContext *avctx)
+{
+    SBContext *s = avctx->priv_data;
+    int ret;
+
+    s->sock = -1;
+    s->is_decoder = 1;
+    s->codec_id_wire = (avctx->codec_id == AV_CODEC_ID_HEVC) ? 1 : 0;
+
+    if (s->port <= 0) {
+        const char *env = getenv("BRIDGE_PORT");
+        s->port = env ? atoi(env) : 0;
+        if (s->port <= 0 || s->port > 65535)
+            s->port = SB_DEFAULT_PORT;
+    }
+
+    avctx->pix_fmt = AV_PIX_FMT_YUV420P;
+
+    ret = sb_connect(avctx, s);
+    if (ret < 0)
+        return ret;
+
+    ret = sb_handshake(avctx, s, s->sock, 0);
+    if (ret < 0)
+        return ret;
+
+    av_log(avctx, AV_LOG_INFO, "selinuxbridge: using on-device component %s\n",
+           s->codec_name);
+
+    /*
+     * Until the bridge announces the real size, assume whatever the
+     * container claimed. A format record always precedes the first frame,
+     * so this is only ever a starting guess.
+     */
+    s->dec_w = avctx->width;
+    s->dec_h = avctx->height;
+
+    pthread_mutex_init(&s->lock, NULL);
+    pthread_cond_init(&s->cond, NULL);
+    if (pthread_create(&s->reader, NULL, sb_reader_thread, s) != 0) {
+        av_log(avctx, AV_LOG_ERROR, "selinuxbridge: cannot start reader thread\n");
+        return AVERROR(ENOMEM);
+    }
+    s->reader_started = 1;
+    return 0;
+}
+
+/* Copies one tightly packed I420 frame off the wire into an AVFrame. */
+static int sb_unpack_frame(AVCodecContext *avctx, AVFrame *frame,
+                           const uint8_t *buf, int size, int w, int h)
+{
+    const int cw = (w + 1) / 2, ch = (h + 1) / 2;
+    const int64_t want = (int64_t)w * h + 2LL * cw * ch;
+    const uint8_t *src = buf;
+    int ret;
+
+    if (w <= 0 || h <= 0) {
+        av_log(avctx, AV_LOG_ERROR,
+               "selinuxbridge: frame received before any format record\n");
+        return AVERROR_INVALIDDATA;
+    }
+    if (size < want) {
+        av_log(avctx, AV_LOG_ERROR,
+               "selinuxbridge: short frame, got %d bytes, expected %"PRId64
+               " for %dx%d\n", size, want, w, h);
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (w != avctx->width || h != avctx->height) {
+        ret = ff_set_dimensions(avctx, w, h);
+        if (ret < 0)
+            return ret;
+    }
+
+    ret = ff_get_buffer(avctx, frame, 0);
+    if (ret < 0)
+        return ret;
+
+    for (int y = 0; y < h; y++)
+        memcpy(frame->data[0] + (size_t)y * frame->linesize[0], src + (size_t)y * w, w);
+    src += (size_t)w * h;
+    for (int y = 0; y < ch; y++)
+        memcpy(frame->data[1] + (size_t)y * frame->linesize[1], src + (size_t)y * cw, cw);
+    src += (size_t)cw * ch;
+    for (int y = 0; y < ch; y++)
+        memcpy(frame->data[2] + (size_t)y * frame->linesize[2], src + (size_t)y * cw, cw);
+
+    return 0;
+}
+
+static int sb_collect_frame(AVCodecContext *avctx, AVFrame *frame,
+                            int *got_frame, int draining)
+{
+    SBContext *s = avctx->priv_data;
+    SBPacket *node;
+    int ret;
+
+    for (;;) {
+        pthread_mutex_lock(&s->lock);
+        while (!s->head && !s->reader_done && draining)
+            pthread_cond_wait(&s->cond, &s->lock);
+        node = sb_pop(s);
+        ret = (!node && s->reader_error) ? AVERROR_EXTERNAL : 0;
+        pthread_mutex_unlock(&s->lock);
+
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "selinuxbridge: bridge connection failed mid-stream\n");
+            return ret;
+        }
+        if (!node)
+            return 0;
+
+        if (node->is_format) {
+            if (node->fmt_w != s->dec_w || node->fmt_h != s->dec_h)
+                av_log(avctx, AV_LOG_VERBOSE,
+                       "selinuxbridge: stream is %dx%d\n", node->fmt_w, node->fmt_h);
+            s->dec_w = node->fmt_w;
+            s->dec_h = node->fmt_h;
+            av_free(node);
+            continue;
+        }
+
+        ret = sb_unpack_frame(avctx, frame, node->data, node->size,
+                              s->dec_w, s->dec_h);
+        av_free(node->data);
+        av_free(node);
+        if (ret < 0)
+            return ret;
+
+        if (!sb_pts_pop_min(s, &frame->pts))
+            frame->pts = AV_NOPTS_VALUE;
+        *got_frame = 1;
+        return 0;
+    }
+}
+
+static int sb_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                           int *got_frame, AVPacket *avpkt)
+{
+    SBContext *s = avctx->priv_data;
+    int ret;
+
+    *got_frame = 0;
+
+    if (avpkt->size > 0) {
+        ret = sb_pts_push(s, avpkt->pts);
+        if (ret < 0)
+            return ret;
+        ret = sb_write_i32(s->sock, avpkt->size);
+        if (ret >= 0)
+            ret = sb_write_all(s->sock, avpkt->data, (size_t)avpkt->size);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "selinuxbridge: sending an access unit failed (%s) -- the bridge "
+                   "app may have been backgrounded or closed\n", av_err2str(ret));
+            return ret;
+        }
+    } else if (!s->eos_sent) {
+        ret = sb_write_i32(s->sock, -1);
+        if (ret < 0)
+            return ret;
+        s->eos_sent = 1;
+    }
+
+    ret = sb_collect_frame(avctx, frame, got_frame, avpkt->size == 0);
+    if (ret < 0)
+        return ret;
+    return avpkt->size;
+}
+
 /* ------------------------------------------------------------ registry */
 
 #define OFFSET(x) offsetof(SBContext, x)
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+#define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
+
+#define SB_COMMON_OPTIONS(flags)                                             \
+    { "bridge_port", "TCP port the SELinux Hardware Bridge app listens on",  \
+      OFFSET(port), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 65535, flags },        \
+    { "bridge_timeout", "seconds of bridge inactivity before failing",       \
+      OFFSET(timeout), AV_OPT_TYPE_INT, { .i64 = SB_DEFAULT_TIMEOUT }, 1, 3600, flags }
 
 static const AVOption sb_options[] = {
-    { "bridge_port", "TCP port the SELinux Hardware Bridge app listens on",
-      OFFSET(port), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 65535, VE },
-    { "bridge_timeout", "seconds of bridge inactivity before failing",
-      OFFSET(timeout), AV_OPT_TYPE_INT, { .i64 = SB_DEFAULT_TIMEOUT }, 1, 3600, VE },
+    SB_COMMON_OPTIONS(VE),
+    { NULL }
+};
+
+static const AVOption sb_dec_options[] = {
+    SB_COMMON_OPTIONS(VD),
     { NULL }
 };
 
@@ -786,9 +1058,38 @@ const FFCodec ff_##ctype##_selinuxbridge_encoder = {                         \
     .priv_data_size = sizeof(SBContext),                                     \
     .init           = sb_encode_init,                                        \
     FF_CODEC_ENCODE_CB(sb_encode_frame),                                     \
-    .close          = sb_encode_close,                                       \
+    .close          = sb_close,                                       \
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,                             \
 };
 
 SB_ENCODER(h264, H264, "H.264 via Qualcomm Codec2 (SELinux Hardware Bridge)")
 SB_ENCODER(hevc, HEVC, "HEVC via Qualcomm Codec2 (SELinux Hardware Bridge)")
+
+#define SB_DECODER(ctype, CTYPE, desc, bsf)                                  \
+static const AVClass ctype##_selinuxbridge_dec_class = {                     \
+    .class_name = #ctype "_selinuxbridge",                                   \
+    .item_name  = av_default_item_name,                                      \
+    .option     = sb_dec_options,                                            \
+    .version    = LIBAVUTIL_VERSION_INT,                                     \
+};                                                                           \
+const FFCodec ff_##ctype##_selinuxbridge_decoder = {                         \
+    .p.name         = #ctype "_selinuxbridge",                               \
+    .p.long_name    = NULL_IF_CONFIG_SMALL(desc),                            \
+    .p.type         = AVMEDIA_TYPE_VIDEO,                                    \
+    .p.id           = AV_CODEC_ID_##CTYPE,                                   \
+    .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING |      \
+                      AV_CODEC_CAP_HARDWARE,                                 \
+    .p.priv_class   = &ctype##_selinuxbridge_dec_class,                      \
+    .p.wrapper_name = "selinuxbridge",                                       \
+    .priv_data_size = sizeof(SBContext),                                     \
+    .init           = sb_decode_init,                                        \
+    FF_CODEC_DECODE_CB(sb_decode_frame),                                     \
+    .close          = sb_close,                                              \
+    .bsfs           = bsf,                                                   \
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,                             \
+};
+
+SB_DECODER(h264, H264, "H.264 via Qualcomm Codec2 (SELinux Hardware Bridge)",
+           "h264_mp4toannexb")
+SB_DECODER(hevc, HEVC, "HEVC via Qualcomm Codec2 (SELinux Hardware Bridge)",
+           "hevc_mp4toannexb")

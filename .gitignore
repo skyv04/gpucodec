@@ -11,3 +11,4 @@ cpu_sad
 
 # encoded output
 *.agc
+__pycache__/

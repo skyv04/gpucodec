@@ -43,19 +43,20 @@ to remind you.
 
 | File | Purpose |
 |---|---|
-| `AndroidManifest.xml` | One activity, one foreground service. `INTERNET` permission only for the loopback socket. |
-| `app/src/main/java/com/selinuxbridge/app/MainActivity.java` | Launcher UI; starts the bridge service in the foreground so Android doesn't kill it. Everything is drawn programmatically (gradients, a small chip-logo icon, a pulsing "alive" status dot, a data-flow diagram) rather than a blank white screen — see screenshot note below. |
+| `AndroidManifest.xml` | One activity, one foreground service, one boot receiver. `INTERNET` only for the loopback socket; `RECEIVE_BOOT_COMPLETED` and `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` for the gap-#4 mitigations. |
+| `app/src/main/java/com/selinuxbridge/app/MainActivity.java` | Launcher UI; starts the bridge service in the foreground so Android doesn't kill it, and shows the current Doze state with a one-tap battery-optimisation exemption. Everything is drawn programmatically (gradients, a small chip-logo icon, a pulsing "alive" status dot, a data-flow diagram) rather than a blank white screen — see screenshot note below. |
 | `app/src/main/java/com/selinuxbridge/app/BridgeService.java` | The actual bridge: `ServerSocket` on `127.0.0.1:7878`, wire protocol below, drives `android.media.MediaCodec` synchronously, explicitly preferring hardware (`c2.qti.*`) codec components, admits sessions through a semaphore sized from the device's own codec-instance limit, one thread per client so a crashed session doesn't take down the accept loop, and logs to a file it can also stream back over the socket. |
+| `app/src/main/java/com/selinuxbridge/app/BootReceiver.java` | Restarts the service after a reboot (`BOOT_COMPLETED`/`QUICKBOOT_POWERON`) and after an in-place update (`MY_PACKAGE_REPLACED`), so the two recoverable halves of gap #4 need no human. |
 | `app/src/main/java/com/selinuxbridge/app/I420.java` | Conversion between the tightly packed I420 the wire protocol carries and whatever layout MediaCodec actually hands out (padded row strides, padded slice heights, semi-planar chroma). Deliberately framework-free so it can be unit tested on a normal JVM. |
-| `bridge_client.c` | Debian-side client/CLI: connects over loopback, sends raw frames or a bitstream (from a file or a pipe), prints round-trip stats and the codec name actually used. Supports `encode`/`decode`/`info`/`log`, h264/hevc/vp9/av1 via `-c`, bounded socket timeouts with a distinct exit code, and a streaming Annex-B splitter with O(1) memory. |
+| `bridge_client.c` | Debian-side client/CLI: connects over loopback, sends raw frames or a bitstream (from a file or a pipe), prints round-trip stats and the codec name actually used. Supports `encode`/`decode`/`info`/`log`, h264/hevc/vp9/av1 via `-c`, bounded socket timeouts with a distinct exit code, a streaming Annex-B splitter with O(1) memory, and v4 format records so `decode` needs no dimensions. |
 | `build.sh` | Rebuilds the signed APK from source using raw SDK command-line tools (`aapt2`, `javac`, `d8`, `apksigner`) — no gradle/network dependency. Signs with a persistent key in `keystore/` so rebuilds install as in-place updates. |
 | `keystore/` | Local debug signing key, gitignored. Kept outside `build/` so `build.sh`'s clean step cannot destroy it (see gap #9). |
-| `../ffmpeg/selinuxbridge.c` | libavcodec wrapper registering `h264_selinuxbridge` / `hevc_selinuxbridge` as real ffmpeg encoders. |
-| `../ffmpeg/selinuxbridge-ffmpeg.patch` | The two-file registration patch (`allcodecs.c`, `Makefile`) that ffmpeg's build needs. |
+| `../ffmpeg/selinuxbridge.c` | libavcodec wrapper registering `h264_selinuxbridge` / `hevc_selinuxbridge` as real ffmpeg **encoders and decoders**. |
+| `../ffmpeg/selinuxbridge-ffmpeg.patch` | The three-file registration patch (`allcodecs.c`, `Makefile`, `configure`) that ffmpeg's build needs. |
 | `tools/bridge-status` | Health-check script: reports whether the app is reachable and prints its `info` diagnostics (device, Android version, all four video codecs and which are hardware-backed, concurrency limit). `--log` also dumps the app's log. |
-| `tools/hw-transcode` | Wrapper that pipes an arbitrary ffmpeg-readable input through the bridge's hardware encoder and remuxes to a normal container — the hardware-codec analogue of this repo's `agc-from`/`agc-to`. `-c hevc` selects HEVC. |
+| `tools/hw-transcode` | Wrapper that pipes an arbitrary ffmpeg-readable input through the bridge's hardware encoder and remuxes to a normal container — the hardware-codec analogue of this repo's `agc-from`/`agc-to`. `-c hevc` selects HEVC; `-D` also decodes on the hardware block, making the transcode hardware end to end. |
 | `tools/selftest` | Full regression suite. Needs no phone and no installed APK: it runs everything against the mock bridge, including fault injection that cannot be arranged reliably on real hardware. |
-| `tools/mock-bridge.py` | A protocol-v3 bridge that reproduces the awkward parts of MediaCodec — codec-config packets, one packet per access unit, lookahead that swallows frames before emitting anything — backed by a real x264/x265 subprocess so the output is a genuine stream. |
+| `tools/mock-bridge.py` | A protocol-v4 bridge that reproduces the awkward parts of MediaCodec — codec-config packets, one packet per access unit, lookahead that swallows frames before emitting anything, decode format records — backed by a real x264/x265 subprocess so the output is a genuine stream. `MOCK_RESIZE_AT=N` forces a mid-stream resolution change, which is impractical to provoke on real hardware. |
 | `tools/test-i420` | JVM unit tests for `I420.java` across planar, semi-planar, padded-stride, padded-slice-height, odd-dimension and cropped layouts. |
 
 ## Building
@@ -154,7 +155,7 @@ network-fetched design tooling.
   open-sourced it in 2000), used the same way this repo's own docs already
   refer to it throughout.
 
-## Wire protocol (v3)
+## Wire protocol (v4)
 
 All integers are 4-byte big-endian (`DataInputStream`/`DataOutputStream`
 network order). One TCP connection = one session.
@@ -165,7 +166,7 @@ network order). One TCP connection = one session.
    | field | meaning |
    |---|---|
    | `mode` | `0` encode, `1` decode, `2` info, `3` log |
-   | `width`/`height` | frame size (encode/decode only) |
+   | `width`/`height` | frame size; decode may send `0 0` and learn the real size from the format record below |
    | `fps`/`bitrate` | encode only; send 0 otherwise |
    | `codec` | `0` h264, `1` hevc, `2` vp9, `3` av1 — **new in v3** |
 
@@ -192,6 +193,23 @@ network order). One TCP connection = one session.
      flexible for decode). `length == -1` on the final reply signals
      end-of-stream.
 
+5. **Format records — new in v4, decode only.** The server's output stream
+   may carry `int32 -2` followed by `int32 width` and `int32 height`. One
+   always precedes the first frame, and another is emitted whenever the
+   picture size changes mid-stream. Every frame after a record is tightly
+   packed I420 at those dimensions.
+
+   This is what lets a decode client stop guessing: the picture size lives
+   in the bitstream's parameter sets, not in anything the caller knows, and
+   MediaCodec reports it (crop rectangle included) only once it has actually
+   decoded something. `bridge_client decode in.h264 out.yuv` therefore takes
+   no dimensions at all, and the libavcodec decoder gets what it needs to
+   call `ff_set_dimensions()` at the right moment.
+
+   Lengths of `-3` or below are reserved. A client must treat one as a
+   protocol error rather than guessing — otherwise a future record type
+   would be read as a frame length and desynchronise the stream silently.
+
 ### Version history
 
 | version | change |
@@ -199,11 +217,15 @@ network order). One TCP connection = one session.
 | v1 | bare `int32` status, no codec name or error message |
 | v2 | status gained a length-prefixed codec-name/error-message field; added `info` (mode 2) |
 | v3 | added the `codec` handshake field (hevc/vp9/av1) and `log` (mode 3) |
+| v4 | added decode format records (`-2 w h`), so decode dimensions are optional and a mid-stream resolution change is a normal event |
 
 Versions are **not** wire-compatible with each other. A v3 client talking to
 a v2 server happens to work for `info` (the extra `codec` int is simply never
-read before the server replies), but encode/decode will mis-frame — update
-both sides together.
+read before the server replies), and a v4 client talking to a v3 server works
+for everything except decode (a v3 server simply never sends a format record,
+so the client has no size to report), but in general encode/decode will
+mis-frame — update both sides together. `bridge_client info` prints the
+server's protocol version, which is the quickest way to spot a mismatch.
 
 ### Concurrency limit
 
@@ -287,23 +309,29 @@ connection and then goes quiet, a bridge that is out of codec slots, a
 semi-planar chroma layout — cannot be arranged reliably on real hardware.
 
 ```sh
-./tools/selftest          # 17 checks, ~60 s
+./tools/selftest          # 27 checks, ~3 min
 ./tools/test-i420         # 10 plane-layout unit tests on a plain JVM
 ```
 
 `tools/selftest` builds `bridge_client`, starts `tools/mock-bridge.py`
 alongside two scripted fault-injection servers, and checks:
 
-- encode and HEVC round trips, and streaming over stdin/stdout;
+- encode, decode and HEVC round trips, and streaming over stdin/stdout;
 - every documented exit code (0/1/2/3), including that a `busy` refusal
   fails immediately instead of pointlessly retrying;
 - that peak RSS stays flat when the input grows 8x (the O(1) splitter);
-- that both ffmpeg encoders produce valid, decodable mp4s with timestamps;
+- that a v4 decode works with **no dimensions supplied**, that the format
+  record reports the true picture size, that a mid-stream resolution change
+  is announced and produces exactly the right number of bytes, and that an
+  unknown record type is refused rather than mistaken for a length;
+- that both ffmpeg encoders **and both decoders** produce valid, decodable
+  output with surviving timestamps;
 - that Annex-B output keeps its parameter sets inline;
-- that a stalled bridge fails the encode in seconds rather than hanging.
+- that a stalled bridge fails the encode *or the decode* in seconds rather
+  than hanging.
 
-It skips the ffmpeg section cleanly if no build with the `selinuxbridge`
-encoders is present; point it at one with `FFMPEG=/path/to/ffmpeg`.
+It skips the ffmpeg sections cleanly if no build with the `selinuxbridge`
+codecs is present; point it at one with `FFMPEG=/path/to/ffmpeg`.
 
 ## Testing the bridge
 
@@ -466,13 +494,13 @@ signing key.
 
 `bridge_client` and `hw-transcode` are fine for scripting, but anything that
 drives libavcodec directly (Shotcut, Blender, an ffmpeg one-liner) cannot
-call them. So the bridge is also packaged as a pair of real libavcodec
-encoders:
+call them. So the bridge is also packaged as real libavcodec codecs — both
+directions:
 
-| encoder | codec id | component it drives |
+| name | codec id | components it drives |
 |---|---|---|
-| `h264_selinuxbridge` | `AV_CODEC_ID_H264` | `c2.qti.avc.encoder` |
-| `hevc_selinuxbridge` | `AV_CODEC_ID_HEVC` | `c2.qti.hevc.encoder` |
+| `h264_selinuxbridge` | `AV_CODEC_ID_H264` | `c2.qti.avc.encoder` / `c2.qti.avc.decoder` |
+| `hevc_selinuxbridge` | `AV_CODEC_ID_HEVC` | `c2.qti.hevc.encoder` / `c2.qti.hevc.decoder` |
 
 These attach to the **existing** H.264/HEVC codec ids rather than inventing
 a new one (the same convention as `h264_v4l2m2m`, `h264_nvenc` and friends),
@@ -485,10 +513,18 @@ format and needs all of those.
 cd ffmpeg && ./build-selinuxbridge.sh      # patches + rebuilds ffmpeg
 
 FF=~/build/ffmpeg-agc1-install
-LD_LIBRARY_PATH=$FF/lib $FF/bin/ffmpeg -encoders | grep selinuxbridge
+LD_LIBRARY_PATH=$FF/lib $FF/bin/ffmpeg -codecs | grep selinuxbridge
 
+# hardware encode
 LD_LIBRARY_PATH=$FF/lib $FF/bin/ffmpeg \
     -i input.mp4 -c:v h264_selinuxbridge -b:v 4M output.mp4
+
+# hardware decode (the option goes before -i, like any decoder option)
+LD_LIBRARY_PATH=$FF/lib $FF/bin/ffmpeg \
+    -c:v h264_selinuxbridge -i input.mp4 -f rawvideo output.yuv
+
+# both at once -- hardware end to end
+FFMPEG=$FF/bin/ffmpeg ./tools/hw-transcode -D input.mp4 output.mp4
 ```
 
 Private options: `-bridge_port` (default 7878, also read from `$BRIDGE_PORT`
@@ -526,8 +562,22 @@ Implementation notes worth knowing:
   input order: each input pts is queued and one is popped per emitted
   packet, which restores them exactly. Without this the muxer warns
   "Timestamps are unset" and invents its own.
-- **Encode only.** See "What this does *not* solve" at the bottom for why
-  there is deliberately no `*_selinuxbridge` decoder yet.
+- **Decoding needs Annex-B, and gets it for free.** The decoders declare
+  `FFCodec.bsfs = "h264_mp4toannexb"` / `"hevc_mp4toannexb"` exactly as
+  `h264_mediacodec` does, so a length-prefixed `mp4`/`mov` source is
+  converted before it ever reaches the bridge and `-c:v h264_selinuxbridge
+  -i whatever.mp4` simply works.
+- **Decoded dimensions come from the wire, not the container.** The decoder
+  never parses the bitstream: it sizes its frames from the v4 format records
+  and calls `ff_set_dimensions()` when one changes, which is also what makes
+  a mid-stream resolution change survivable.
+- **Decoded timestamps are reordered, not replayed.** Packets go in in
+  decode order and frames come back in display order, so popping input
+  timestamps FIFO would permute them on any stream with B-frames. The
+  decoder instead pops the **smallest outstanding** pts per frame, which is
+  by definition the next one to be displayed; for a stream without B-frames
+  it degenerates to plain FIFO. (The encoder can use FIFO safely because it
+  configures Codec2 without B-frames in the first place.)
 
 ## Stress test results (verified on this device)
 
@@ -623,23 +673,25 @@ and every signal available at the time — frame counts, bitrate, file size,
 decodability, luma PSNR — said the bridge was working perfectly.
 
 Status column: **fixed** entries have been implemented and verified (see
-"Verification of the fixes" below); gap #4 is a hard Android platform
-constraint and is the only one that cannot be closed.
+"Verification of the fixes" below). Only gap #4 is still open, and only
+partly: its recoverable halves now heal themselves, but the residue is a
+deliberate Android platform behaviour that no unprivileged app can change.
 
 | # | Gap | Severity | Status | Fix that shipped |
 |---|---|---|---|---|
 | 1 | **4+ concurrent sessions hang.** 3 concurrent passed cleanly; 4 reproducibly hung, jobs hitting a 45 s timeout and emitting truncated streams (59/60 frames, `bytestream -7` errors). Codec2 blocks in `configure()`/`start()` past its instance cap instead of failing. | **High** | ✅ fixed | `BridgeService` now reads `CodecCapabilities.getMaxSupportedInstances()` across the `c2.qti.*` video components, keeps one instance spare, and gates every encode/decode session behind a fair counting semaphore. Overflow waits 5 s for a slot, then is **rejected** with a `busy` error over the existing error channel instead of blocking. `info` mode reports the limit and how many slots are free. |
 | 2 | **Client hangs forever on a stalled server.** `bridge_client` had no socket timeout and sat until an external `timeout(1)` killed it. | **High** | ✅ fixed | `SO_RCVTIMEO`/`SO_SNDTIMEO` (default 30 s, `BRIDGE_TIMEOUT` to override) on every connection, a distinct **exit code 3** for "bridge stalled", and an actionable diagnostic. The reader also `shutdown()`s the socket before joining the writer thread, so a timeout can't be re-introduced by the join. |
 | 3 | **Transient first-run stall.** The very first sweep hung >120 s at 640x360; the identical command then ran in 0.15 s and never reproduced across ~80 later sessions. Most likely Android throttling the off-screen app. | Medium | ✅ mitigated | Now surfaces as a bounded timeout (fix #2) rather than an indefinite hang, and `bridge_client` **auto-retries once** on timeout (`BRIDGE_RETRIES`). Retry is disabled when either side is `-` (stdin/stdout can't be rewound, so retrying would silently truncate output); `hw-transcode` therefore propagates exit 3 with an explanation instead. |
-| 4 | **App must stay open.** Foreground service survives backgrounding but not force-stop/swipe-away; it is not a Linux daemon. | Medium | ⛔ inherent | Cannot be fixed without root. `START_STICKY` is already set. Partial mitigations: battery-optimisation exemption, boot-completed receiver. |
+| 4 | **App must stay open.** Foreground service survives backgrounding but not force-stop/swipe-away; it is not a Linux daemon. | Medium | ⚠️ mitigated | The two recoverable halves are now automatic: a `BootReceiver` restarts the service on `BOOT_COMPLETED`/`QUICKBOOT_POWERON` (so a reboot no longer leaves a dead port) and on `MY_PACKAGE_REPLACED` (so installing a new build doesn't), and the landing screen shows the Doze state with a one-tap battery-optimisation exemption. The notification is `setOngoing` with a content intent, so a backgrounded bridge is one tap from the foreground. **A force-stop still needs a manual launch** — Android deliberately blocks every receiver of a force-stopped package until the user launches it, and there is no way around that without root. |
 | 5 | **`bridge.log` unreadable from Debian.** Android 11+ scoped storage denies `/sdcard/Android/data/com.selinuxbridge.app` to every other app and to the PRoot shell. | Low | ✅ fixed | New `mode=3` streams the log file back over the same loopback socket: `bridge_client log`, or `tools/bridge-status --log`. |
 | 6 | **Only H.264, and only the codec.** No HEVC/VP9/AV1; no camera or other SELinux-gated hardware despite the app's name. | Low | ✅ fixed (codecs) | Protocol v3 adds a `codec` field: `0=h264 1=hevc 2=vp9 3=av1`, selected with `bridge_client -c hevc …` or `hw-transcode -c hevc`. `info` now enumerates every one of the four and flags which are `[hardware]`. Camera remains future work — it needs a new `mode=`, not a protocol change. |
-| 7 | **No `ffmpeg` integration.** AGC-1 ships an `FFCodec`; the bridge did not. | Low | ✅ fixed | `ffmpeg/selinuxbridge.c` registers `h264_selinuxbridge` and `hevc_selinuxbridge` as real libavcodec encoders on the existing `AV_CODEC_ID_H264`/`AV_CODEC_ID_HEVC` ids, so `ffmpeg -c:v h264_selinuxbridge` just works. See "Using it from ffmpeg" below. |
+| 7 | **No `ffmpeg` integration.** AGC-1 ships an `FFCodec`; the bridge did not. | Low | ✅ fixed | `ffmpeg/selinuxbridge.c` registers `h264_selinuxbridge` and `hevc_selinuxbridge` as real libavcodec **encoders and decoders** on the existing `AV_CODEC_ID_H264`/`AV_CODEC_ID_HEVC` ids, so both `-c:v h264_selinuxbridge` (encode) and `-c:v h264_selinuxbridge -i in.mp4` (decode) just work. See "Using it from ffmpeg" below. |
 | 8 | **No back-pressure / unbounded buffering.** The decode path read the entire elementary stream into RAM before sending anything. | Low | ✅ fixed | The Annex-B splitter is now streaming: it holds at most one NAL unit plus a read chunk. Memory is O(1) in clip length instead of O(n), and units start flowing immediately instead of after the whole input is read. Framing is byte-identical to the old splitter. |
 | 9 | **Throwaway debug signing key.** `build.sh` wrote `build/debug.keystore`, which its own `rm -rf build` then destroyed, so every rebuild changed the app's signing identity and Android refused to update in place. | Low | ✅ fixed | The key moved to `selinux-bridge/keystore/` (gitignored), outside the wipe. An existing `build/debug.keystore` is migrated automatically before the wipe so already-installed copies keep updating. Two consecutive builds now produce the same certificate digest. |
 | 10 | **Colour was silently destroyed.** Every encode produced a perfect luma plane and garbage chroma (Y PSNR 38 dB, U/V **6.7 dB**) at every resolution. `BridgeService` requested `COLOR_FormatYUV420Flexible` and then blitted the wire bytes straight into the input buffer — but "flexible" does not mean planar I420. On Qualcomm the chroma comes back **semi-planar**, U and V aliasing one region with a pixel stride of 2, and rows padded to the component's own alignment. Found only because a PSNR check happened to print U and V separately; frame counts, bitrate, decodability and luma quality all looked perfectly healthy. | **High** | ✅ fixed | New `I420.java` copies plane by plane through `getInputImage()`/`getOutputImage()`, honouring `getRowStride()` and `getPixelStride()`, so planar, semi-planar and padded layouts are all correct. The same path repacks decoder output into tightly packed I420. Covered by 10 JVM unit tests (`tools/test-i420`). |
 | 11 | **Rate control was inoperative.** Every frame was queued with `presentationTimeUs = 0`, so the encoder believed the whole clip was instantaneous. A 6 Mbps request delivered **2.98 Mbps**. | Medium | ✅ fixed | Frames are now queued at `frameIndex * 1_000_000 / fps` in both directions. |
-| 12 | **No tests, and the ones that mattered were untestable.** Everything was verified by hand against a live phone, so nothing could be checked before an install tap, and failure modes (a bridge that stalls, a bridge that is out of slots, a semi-planar chroma layout) could not be reproduced on demand at all. | Medium | ✅ fixed | `tools/selftest` runs 17 checks with no device attached — client round trips, exit codes, fault injection, flat-memory proof, both ffmpeg encoders, Annex-B parameter sets, timestamps — plus `tools/test-i420`'s 10 layout cases. `tools/mock-bridge.py` reproduces MediaCodec's awkward behaviour deliberately. |
+| 12 | **No tests, and the ones that mattered were untestable.** Everything was verified by hand against a live phone, so nothing could be checked before an install tap, and failure modes (a bridge that stalls, a bridge that is out of slots, a semi-planar chroma layout) could not be reproduced on demand at all. | Medium | ✅ fixed | `tools/selftest` runs 27 checks with no device attached — client round trips, exit codes, fault injection, flat-memory proof, both ffmpeg encoders **and both decoders**, protocol-v4 format records and mid-stream resolution changes, Annex-B parameter sets, timestamps — plus `tools/test-i420`'s 10 layout cases. `tools/mock-bridge.py` reproduces MediaCodec's awkward behaviour deliberately. |
+| 13 | **Decode could not be wired into libavcodec.** The protocol never carried the decoded picture size, so a libavcodec decoder had no way to size its frames or to notice a resolution change. Callers had to know the dimensions up front and pass them in. | Medium | ✅ fixed | Protocol v4 adds decode format records (`-2 w h`), taken from the output `Image`'s own crop rectangle so they are the display size rather than the macroblock-padded coded size. `bridge_client decode` no longer takes dimensions at all, and `h264_selinuxbridge`/`hevc_selinuxbridge` now exist as decoders. |
 
 ## Verification of the fixes
 
@@ -665,22 +717,40 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #7 ffmpeg | bridge stalls mid-encode, `-bridge_timeout 3` | ffmpeg **fails in 6 s** instead of hanging |
 | #10 chroma | 10 JVM unit tests over planar / semi-planar / padded-stride / padded-slice / odd-size / cropped layouts | every case round-trips **byte-exactly** |
 | #10 chroma | U and V written to a symmetric planar image | land in their own planes (no swap) |
-| #12 tests | `./tools/selftest` with no device attached | **17 passed, 0 failed** |
+| #13 v4 | `bridge_client decode` with **no dimensions given** | format record read off the wire, `detected frame size: 192x128`, 24/24 frames, output exactly **884736 B** |
+| #13 v4 | Mock forced to change resolution at frame 12 (`MOCK_RESIZE_AT`) | announced as `new frame size: 96x64`; output exactly **552960 B** = 12 full + 12 quarter-area frames |
+| #13 v4 | Bridge sends a record type the client has never seen (`-7`) | exit **1** with `protocol error`, *not* a desynchronised stream |
+| #13 v4 | Bridge hangs up mid-stream while the client is still writing | exit **1** with the real diagnostic — previously died of **SIGPIPE** (rc 141) before the reader could report anything |
+| #7 decode | `ffmpeg -c:v h264_selinuxbridge -i in.mp4` | **24/24 frames**; same for `hevc_selinuxbridge` |
+| #7 decode | Bridge output vs the **software** decoder, 320x240x24, SHA-256 of the raw I420 | **byte-identical** (`38c33b71c5143c01…`) — transport, framing, sizing and packing are all lossless |
+| #7 decode | Decoded frame timestamps | survive the round trip (min-pts reorder, so B-frames can't permute them) |
+| #7 decode | Mid-stream resolution change under libavfilter | decoder reconfigures, transcode completes |
+| #7 decode | Bridge stalls, `-bridge_timeout` | fails in **4 s** instead of hanging |
+| #4 restart | `aapt2 dump badging` on the shipped APK | `RECEIVE_BOOT_COMPLETED` + `MY_PACKAGE_REPLACED` receiver present, so reboots and in-place updates self-heal |
+| #12 tests | `./tools/selftest` with no device attached | **27 passed, 0 failed** |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm
 install` from the PRoot shell is denied). They are verified by unit test and
-by inspection; the on-device confirmation — `info` reporting `protocol: v3`
+by inspection; the on-device confirmation — `info` reporting `protocol: v4`
 and its slot count, a 4-concurrent run returning a clean `busy` instead of
 hanging, and chroma PSNR coming back in the 35-45 dB range rather than 6.7 —
-is pending that tap on `/sdcard/Download/selinux-bridge.apk`. The signing
+is pending that tap on `/sdcard/Download/selinux-bridge.apk`. The same
+applies to the server half of protocol v4: the format records are emitted
+from `Image.getCropRect()` in `runPump()`, and every client-side consequence
+of them is covered above against `tools/mock-bridge.py`, but the crop values
+themselves come from a real `MediaCodec` and are verified by inspection. The signing
 key is now stable (gap #9), so it installs as an in-place update.
 
 ## What this does *not* solve
 
-- This still requires the app to be **open and on-screen** (a foreground
-  service survives backgrounding but not a force-stop); it is not a daemon
-  in the Linux sense. This is gap #4 and is not fixable without root.
+- This still needs the app to be **installed and not force-stopped**. It is
+  not a daemon in the Linux sense. A reboot and an in-place update now
+  recover on their own (`BootReceiver`), backgrounding is fine, and the
+  landing screen offers a Doze exemption — but a force-stop (swipe away
+  from recents, or Settings → Force stop) still requires a manual launch,
+  because Android blocks every receiver of a force-stopped package until
+  the user opens it. That residue of gap #4 is not fixable without root.
 - **Only the video codec is wired up so far.** The app/protocol is named
   and structured to generalize to other SELinux-blocked hardware (camera
   capture being the most obvious next target — same DMA-BUF-style access
@@ -691,11 +761,8 @@ key is now stable (gap #9), so it installs as an in-place update.
   `Camera2` for camera), and a corresponding `bridge_client` subcommand —
   the loopback-socket plumbing and per-client threading already in place
   would not need to change.
-- The `ffmpeg` integration covers **encode only**. Decode stays on
-  `bridge_client decode`. The layout problem that used to block it is now
-  solved — `I420.java` repacks decoder output into tightly packed I420
-  whatever the device's native layout is (gap #10) — but a libavcodec
-  decoder also needs the bridge to report the stream's real dimensions and
-  to survive resolution changes mid-stream, neither of which the protocol
-  carries yet. That is the remaining prerequisite for a
-  `*_selinuxbridge` decoder.
+- **Only H.264 and HEVC reach `ffmpeg`.** VP9 and AV1 are selectable over
+  the wire (`bridge_client -c vp9`) but have no libavcodec wrapper, because
+  neither has an `mp4toannexb`-style filter to normalise input framing and
+  VP9/AV1 hardware encode is not advertised on every device that advertises
+  decode. `bridge_client` remains the way to reach them.

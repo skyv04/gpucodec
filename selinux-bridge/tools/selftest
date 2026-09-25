@@ -143,6 +143,78 @@ else
     bad "encode over stdin/stdout failed"
 fi
 
+head_ "Protocol v4"
+
+# The whole point of the format record: a decode client no longer has to know
+# the picture size, and gets told if it changes part-way through.
+if BRIDGE_PORT=$PORT ./bridge_client decode "$TMP/out.h264" "$TMP/dec.yuv" \
+        >/dev/null 2>"$TMP/dec.err"; then
+    want=$(( W * H * 3 / 2 * N ))
+    have=$(wc -c <"$TMP/dec.yuv")
+    if [ "$have" = "$want" ]; then
+        ok "decode with no dimensions returns $N frames of ${W}x${H}"
+    else
+        bad "decode returned $have bytes, expected $want"
+    fi
+    if grep -q "detected frame size: ${W}x${H}" "$TMP/dec.err"; then
+        ok "the format record reports the real picture size"
+    else
+        bad "no format record was reported"
+    fi
+else
+    bad "decode against the mock failed"
+fi
+
+RESIZE_PORT=$((PORT + 3))
+MOCK_RESIZE_AT=$((N / 2)) python3 tools/mock-bridge.py "$RESIZE_PORT" \
+    >"$TMP/resize.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+if BRIDGE_PORT=$RESIZE_PORT ./bridge_client decode "$TMP/out.h264" "$TMP/rz.yuv" \
+        >/dev/null 2>"$TMP/rz.err"; then
+    want=$(( N / 2 * W * H * 3 / 2 + (N - N / 2) * (W / 2) * (H / 2) * 3 / 2 ))
+    have=$(wc -c <"$TMP/rz.yuv")
+    if [ "$have" = "$want" ] && grep -q "new frame size: $((W / 2))x$((H / 2))" "$TMP/rz.err"; then
+        ok "a mid-stream resolution change is announced and handled"
+    else
+        bad "resize run produced $have bytes, expected $want"
+    fi
+else
+    bad "decode against the resizing mock failed"
+fi
+
+if BRIDGE_PORT=$PORT ./bridge_client info 2>/dev/null | grep -q "protocol: v4"; then
+    ok "info reports protocol v4"
+else
+    bad "info did not report protocol v4"
+fi
+
+# A client that does not understand a future record type must say so rather
+# than read the next int as a length and desynchronise the stream.
+BOGUS_PORT=$((PORT + 4))
+cat >"$TMP/bogus.py" <<'PY'
+import socket, struct, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(4)
+while True:
+    c, _ = s.accept()
+    name = b"c2.mock.avc.decoder"
+    c.makefile("rb").read(24)
+    c.sendall(struct.pack(">ii", 0, len(name)) + name)
+    c.sendall(struct.pack(">i", -7))
+    c.close()
+PY
+python3 "$TMP/bogus.py" "$BOGUS_PORT" >/dev/null 2>&1 & PIDS+=($!)
+sleep 1
+BRIDGE_PORT=$BOGUS_PORT BRIDGE_TIMEOUT=5 \
+    ./bridge_client decode "$TMP/out.h264" "$TMP/bogus.yuv" >/dev/null 2>"$TMP/bogus.err"
+rc=$?
+if [ "$rc" -eq 1 ] && grep -q "protocol error" "$TMP/bogus.err"; then
+    ok "an unknown record type is refused as a protocol error"
+else
+    bad "an unknown record type gave rc=$rc without a protocol error"
+fi
+
 head_ "Failure handling"
 
 start=$(date +%s)
@@ -252,6 +324,76 @@ else
         ok "a stalled bridge fails the encode in ${elapsed}s instead of hanging"
     else
         bad "a stalled bridge left ffmpeg running for ${elapsed}s (rc=$rc)"
+    fi
+fi
+
+head_ "ffmpeg decoders"
+if [ ! -x "$FFMPEG" ] || ! "$FFMPEG" -hide_banner -decoders 2>/dev/null \
+        | grep -q h264_selinuxbridge; then
+    skip "no ffmpeg build with the selinuxbridge decoders (set \$FFMPEG)"
+else
+    # An mp4 source is the interesting one: it is length-prefixed, so this
+    # also proves the attached h264_mp4toannexb filter is doing its job.
+    "$FFMPEG" -v error -y -f lavfi -i "testsrc=size=${W}x${H}:rate=30:duration=1" \
+        -frames:v $N -pix_fmt yuv420p -c:v libx264 -preset ultrafast \
+        "$TMP/src.mp4" >/dev/null 2>&1
+    "$FFMPEG" -v error -y -f lavfi -i "testsrc=size=${W}x${H}:rate=30:duration=1" \
+        -frames:v $N -pix_fmt yuv420p -c:v libx265 -tag:v hvc1 \
+        "$TMP/src265.mp4" >/dev/null 2>&1
+
+    for c in h264 hevc; do
+        case $c in
+            h264) src=$TMP/src.mp4 ;;
+            hevc) src=$TMP/src265.mp4 ;;
+        esac
+        if [ ! -s "$src" ]; then skip "no $c source clip"; continue; fi
+        if "$FFMPEG" -v error -y -c:v ${c}_selinuxbridge -bridge_port "$PORT" \
+                -i "$src" -pix_fmt yuv420p -f rawvideo "$TMP/dec_$c.yuv" \
+                >/dev/null 2>&1; then
+            want=$(( W * H * 3 / 2 * N ))
+            have=$(wc -c <"$TMP/dec_$c.yuv")
+            if [ "$have" = "$want" ]; then
+                ok "${c}_selinuxbridge decodes $N frames from mp4"
+            else
+                bad "${c}_selinuxbridge produced $have bytes, expected $want"
+            fi
+        else
+            bad "${c}_selinuxbridge failed to decode"
+        fi
+    done
+
+    # Timestamps have to survive the round trip or every downstream filter
+    # and muxer starts guessing.
+    if "$FFMPEG" -v error -y -c:v h264_selinuxbridge -bridge_port "$PORT" \
+            -i "$TMP/src.mp4" -c:v libx264 -preset ultrafast "$TMP/redec.mp4" \
+            2>&1 | grep -qi "timestamps are unset"; then
+        bad "decoded frames reach the muxer without timestamps"
+    else
+        ok "decoded frame timestamps survive the round trip"
+    fi
+
+    if "$FFMPEG" -v error -y -c:v h264_selinuxbridge -bridge_port "$RESIZE_PORT" \
+            -i "$TMP/src.mp4" -vf "scale=${W}:${H}" -pix_fmt yuv420p \
+            -f rawvideo "$TMP/dec_rz.yuv" >/dev/null 2>&1; then
+        want=$(( W * H * 3 / 2 * N ))
+        have=$(wc -c <"$TMP/dec_rz.yuv")
+        if [ "$have" = "$want" ]; then
+            ok "the decoder survives a mid-stream resolution change"
+        else
+            bad "resized decode produced $have bytes, expected $want"
+        fi
+    else
+        bad "the decoder failed on a mid-stream resolution change"
+    fi
+
+    start=$(date +%s)
+    "$FFMPEG" -v error -y -c:v h264_selinuxbridge -bridge_port "$STALL_PORT" \
+        -bridge_timeout 3 -i "$TMP/src.mp4" -f null - >/dev/null 2>&1
+    rc=$?; elapsed=$(( $(date +%s) - start ))
+    if [ "$rc" -ne 0 ] && [ "$elapsed" -lt 30 ]; then
+        ok "a stalled bridge fails the decode in ${elapsed}s instead of hanging"
+    else
+        bad "a stalled bridge left the decoder running for ${elapsed}s (rc=$rc)"
     fi
 fi
 

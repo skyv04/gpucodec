@@ -11,20 +11,26 @@
 # offload, not a novel format.
 #
 # Usage:
-#   hw-transcode [-c h264|hevc] <in> <out.mp4> [width height fps bitrate]
+#   hw-transcode [-c h264|hevc] [-D] <in> <out.mp4> [width height fps bitrate]
 #
 # width/height/fps/bitrate default to the source's own, probed via ffprobe.
+# -D also decodes on the hardware block, via the h264_selinuxbridge /
+# hevc_selinuxbridge libavcodec decoders, making the whole transcode
+# hardware end to end. It needs an ffmpeg built with ffmpeg/build-selinuxbridge.sh
+# (point $FFMPEG at it) and uses two bridge sessions at once.
 set -eu
 
 usage() {
     cat >&2 <<'EOF'
-usage: hw-transcode [-c CODEC] <in> <out.mp4> [width height fps bitrate]
+usage: hw-transcode [-c CODEC] [-D] <in> <out.mp4> [width height fps bitrate]
 
 Decodes <in> with ffmpeg, re-encodes the raw frames on-device through the
 real Qualcomm hardware encoder (via the SELinux Hardware Bridge app), and remuxes
 the result to <out.mp4>.
 
   -c CODEC   h264 (default) or hevc
+  -D         decode on the hardware block too (needs \$FFMPEG built with the
+             selinuxbridge decoders); makes the transcode hardware end to end
 
 Requires the SELinux Hardware Bridge app (selinux-bridge/) to be installed and
 open on-screen. Run bridge-status first if unsure.
@@ -33,11 +39,16 @@ EOF
 }
 
 codec=h264
-if [ "${1:-}" = "-c" ]; then
-    [ $# -ge 2 ] || usage
-    codec=$2
-    shift 2
-fi
+hwdec=0
+FFMPEG=${FFMPEG:-ffmpeg}
+FFPROBE=${FFPROBE:-ffprobe}
+while [ $# -gt 0 ]; do
+    case ${1:-} in
+        -c) [ $# -ge 2 ] || usage; codec=$2; shift 2 ;;
+        -D|--hw-decode) hwdec=1; shift ;;
+        *) break ;;
+    esac
+done
 
 [ $# -ge 2 ] || usage
 case $1 in -h|--help) usage ;; esac
@@ -61,13 +72,13 @@ fps=${5:-}
 bitrate=${6:-4000000}
 
 if [ -z "$width" ] || [ -z "$height" ]; then
-    dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+    dims=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height \
                     -of csv=p=0 "$in")
     width=${width:-$(echo "$dims" | cut -d, -f1)}
     height=${height:-$(echo "$dims" | cut -d, -f2)}
 fi
 if [ -z "$fps" ]; then
-    fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
+    fps=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=r_frame_rate \
                    -of csv=p=0 "$in" | awk -F/ '{ if ($2==0) print 30; else printf "%d", $1/$2 }')
 fi
 
@@ -75,6 +86,24 @@ PORT=${BRIDGE_PORT:-7878}
 if ! timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
     echo "hw-transcode: bridge app unreachable, is it open? (see bridge-status)" >&2
     exit 1
+fi
+
+DEC_ARGS=
+if [ "$hwdec" = 1 ]; then
+    src_codec=$("$FFPROBE" -v error -select_streams v:0 \
+                   -show_entries stream=codec_name -of csv=p=0 "$in")
+    case $src_codec in
+        h264|hevc) ;;
+        *) echo "hw-transcode: -D needs an H.264 or HEVC source (got '$src_codec')" >&2
+           exit 2 ;;
+    esac
+    if ! "$FFMPEG" -hide_banner -decoders 2>/dev/null | grep -q "${src_codec}_selinuxbridge"; then
+        echo "hw-transcode: \$FFMPEG has no ${src_codec}_selinuxbridge decoder." >&2
+        echo "              Build one with ffmpeg/build-selinuxbridge.sh." >&2
+        exit 2
+    fi
+    DEC_ARGS="-c:v ${src_codec}_selinuxbridge"
+    echo "hw-transcode: decoding with ${src_codec}_selinuxbridge too" >&2
 fi
 
 tmp_bs=$(mktemp --suffix=".$container_fmt")
@@ -87,7 +116,7 @@ echo "hw-transcode: ${width}x${height} @ ${fps}fps, bitrate=${bitrate}, codec=${
 # is not rewindable), so a nonzero exit has to be surfaced rather than
 # swallowed by the pipeline.
 set +e
-ffmpeg -v error -i "$in" -f rawvideo -pix_fmt yuv420p -s "${width}x${height}" -r "$fps" - \
+"$FFMPEG" -v error $DEC_ARGS -i "$in" -f rawvideo -pix_fmt yuv420p -s "${width}x${height}" -r "$fps" - \
   | "$CLIENT" encode -c "$codec" "$width" "$height" "$fps" "$bitrate" - "$tmp_bs"
 rc=$?
 set -e
@@ -99,5 +128,5 @@ elif [ "$rc" -ne 0 ]; then
     exit "$rc"
 fi
 
-ffmpeg -v error -y -f "$container_fmt" -r "$fps" -i "$tmp_bs" -c copy "$out"
+"$FFMPEG" -v error -y -f "$container_fmt" -r "$fps" -i "$tmp_bs" -c copy "$out"
 echo "hw-transcode: wrote $out" >&2

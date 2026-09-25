@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
 """
-Mock SELinux Hardware Bridge speaking protocol v3.
+Mock SELinux Hardware Bridge speaking protocol v4.
 
-Lets bridge_client, the ffmpeg encoders and any other consumer be tested on a
+Lets bridge_client, the ffmpeg codecs and any other consumer be tested on a
 machine with no phone attached, and lets the awkward parts of MediaCodec's
 behaviour be reproduced deliberately instead of waited for.  It mimics the
-three things a client has to cope with:
+things a client has to cope with:
 
   * SPS/PPS (and VPS for HEVC) arrive as a standalone codec-config packet
     before any picture data, exactly like BUFFER_FLAG_CODEC_CONFIG;
   * one output packet per access unit, not per NAL unit;
   * several input frames are swallowed before the first output appears, which
-    is what makes a naive write-then-read client deadlock.
+    is what makes a naive write-then-read client deadlock;
+  * decode output is preceded by a v4 format record announcing the real
+    picture size, and another one whenever that size changes -- which
+    MOCK_RESIZE_AT forces on demand, because provoking a genuine mid-stream
+    resolution change on a real device is impractical.
 
 Frames go through a real x264/x265 subprocess, so the output is a genuine
 stream that corresponds to the input rather than a canned replay.
 
 Usage:  mock-bridge.py [port]           (default 9401)
+Env:    MOCK_RESIZE_AT=N   halve the picture size from decoded frame N on
 """
+import os
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9401
+RESIZE_AT = int(os.environ.get("MOCK_RESIZE_AT", "0"))
 
-# Wire codec id -> (ffmpeg encoder, component name reported to the client)
+# Wire codec id -> (ffmpeg encoder, decoder demuxer, component name)
 CODECS = {
-    0: ("libx264", b"c2.mock.avc.encoder"),
-    1: ("libx265", b"c2.mock.hevc.encoder"),
+    0: ("libx264", "h264", b"c2.mock.avc"),
+    1: ("libx265", "hevc", b"c2.mock.hevc"),
 }
 
 
@@ -82,23 +90,48 @@ def group_access_units(raw, hevc):
     return packets
 
 
-def handle(conn):
-    hdr = conn.recv(24)
-    if len(hdr) < 24:
-        conn.close()
-        return
-    mode, w, h, fps, br, codec = struct.unpack(">6i", hdr)
-    print(f"[mock] mode={mode} {w}x{h} fps={fps} br={br} codec={codec}",
-          flush=True)
+def frame_size(w, h):
+    cw, ch = (w + 1) // 2, (h + 1) // 2
+    return w * h + 2 * cw * ch
 
-    if codec not in CODECS:
-        msg = b"unsupported codec id"
-        conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
-        conn.close()
-        return
 
-    encoder, name = CODECS[codec]
+def halve_i420(buf, w, h):
+    """2:1 subsample a tightly packed I420 frame, for the resize test."""
+    nw, nh = w // 2, h // 2
+    cw, ch = (w + 1) // 2, (h + 1) // 2
+    ncw, nch = (nw + 1) // 2, (nh + 1) // 2
+    out = bytearray()
+    for y in range(nh):
+        row = buf[2 * y * w: 2 * y * w + w]
+        out += bytes(row[2 * x] for x in range(nw))
+    for base in (w * h, w * h + cw * ch):
+        for y in range(nch):
+            row = buf[base + 2 * y * cw: base + 2 * y * cw + cw]
+            out += bytes(row[2 * x] for x in range(ncw))
+    return bytes(out), nw, nh
+
+
+def probe_dimensions(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", path],
+        capture_output=True, text=True).stdout.strip()
+    w, h = out.split(",")[:2]
+    return int(w), int(h)
+
+
+INFO_REPORT = (
+    "SELinux Hardware Bridge diagnostics (mock)\n"
+    "device: mock (mock)\n"
+    "protocol: v4\n"
+    "concurrent codec slots: 3 (3 free)\n"
+)
+
+
+def handle_encode(conn, f, w, h, fps, codec):
+    encoder, _, name = CODECS[codec]
     hevc = codec == 1
+    name = name + b".encoder"
     conn.sendall(struct.pack(">ii", 0, len(name)) + name)
 
     args = ["ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p",
@@ -112,8 +145,6 @@ def handle(conn):
 
     enc = subprocess.Popen(args, stdin=subprocess.PIPE,
                            stdout=subprocess.PIPE)
-
-    f = conn.makefile("rb")
     nframes = [0]
 
     def feeder():
@@ -147,7 +178,94 @@ def handle(conn):
     conn.sendall(struct.pack(">i", -1))
     print(f"[mock] in={nframes[0]} frames, out={len(packets)} packets "
           f"({len(raw)} bytes)", flush=True)
-    conn.close()
+
+
+def handle_decode(conn, f, codec):
+    """
+    Decode side, protocol v4.
+
+    Real MediaCodec discovers the picture size from the stream's parameter
+    sets, not from the client, so this deliberately ignores the handshake's
+    width/height and announces what it finds. Input is buffered whole before
+    anything is decoded, which also reproduces the lookahead a client must
+    tolerate.
+    """
+    _, demuxer, name = CODECS[codec]
+    name = name + b".decoder"
+    conn.sendall(struct.pack(">ii", 0, len(name)) + name)
+
+    units, nunits = bytearray(), 0
+    while True:
+        b = f.read(4)
+        if len(b) < 4:
+            break
+        (length,) = struct.unpack(">i", b)
+        if length < 0:
+            break
+        units += f.read(length)
+        nunits += 1
+
+    with tempfile.NamedTemporaryFile(suffix="." + demuxer) as tf:
+        tf.write(units)
+        tf.flush()
+        try:
+            w, h = probe_dimensions(tf.name)
+        except Exception:
+            conn.sendall(struct.pack(">i", -1))
+            print("[mock] decode: unprobeable stream", flush=True)
+            return
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", demuxer, "-i", tf.name,
+             "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"],
+            capture_output=True).stdout
+
+    fsz = frame_size(w, h)
+    nframes = len(raw) // fsz
+    announced = None
+    for i in range(nframes):
+        frame = raw[i * fsz:(i + 1) * fsz]
+        fw, fh = w, h
+        if RESIZE_AT and i >= RESIZE_AT:
+            frame, fw, fh = halve_i420(frame, w, h)
+        if (fw, fh) != announced:
+            conn.sendall(struct.pack(">iii", -2, fw, fh))
+            announced = (fw, fh)
+        conn.sendall(struct.pack(">i", len(frame)) + frame)
+    conn.sendall(struct.pack(">i", -1))
+    print(f"[mock] decode: in={nunits} units, out={nframes} frames at {w}x{h}"
+          + (f" (resized at {RESIZE_AT})" if RESIZE_AT else ""), flush=True)
+
+
+def handle(conn):
+    f = conn.makefile("rb")
+    hdr = f.read(24)
+    if not hdr or len(hdr) < 24:
+        conn.close()
+        return
+    mode, w, h, fps, br, codec = struct.unpack(">6i", hdr)
+    print(f"[mock] mode={mode} {w}x{h} fps={fps} br={br} codec={codec}",
+          flush=True)
+
+    try:
+        if mode in (2, 3):
+            payload = (INFO_REPORT if mode == 2 else "(mock log)\n").encode()
+            conn.sendall(struct.pack(">ii", 0, 3) + b"n/a")
+            conn.sendall(struct.pack(">i", len(payload)) + payload)
+            conn.sendall(struct.pack(">i", -1))
+        elif codec not in CODECS:
+            msg = b"unsupported codec id"
+            conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+        elif mode == 0:
+            handle_encode(conn, f, w, h, fps, codec)
+        elif mode == 1:
+            handle_decode(conn, f, codec)
+        else:
+            msg = b"unknown mode"
+            conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        conn.close()
 
 
 def main():
@@ -155,7 +273,7 @@ def main():
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("127.0.0.1", PORT))
     s.listen(8)
-    print(f"[mock] v3 bridge listening on 127.0.0.1:{PORT}", flush=True)
+    print(f"[mock] v4 bridge listening on 127.0.0.1:{PORT}", flush=True)
     while True:
         c, _ = s.accept()
         threading.Thread(target=handle, args=(c,), daemon=True).start()

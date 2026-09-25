@@ -10,7 +10,7 @@
  *
  * Usage:
  *   bridge_client encode [-c CODEC] <w> <h> <fps> <bitrate> <in.yuv420> <out.bs>
- *   bridge_client decode [-c CODEC] <w> <h> <in.bs> <out.yuv420>
+ *   bridge_client decode [-c CODEC] [<w> <h>] <in.bs> <out.yuv420>
  *   bridge_client info
  *   bridge_client log
  *
@@ -25,17 +25,19 @@
  * Exit codes:
  *   0 ok   1 error   2 usage   3 timed out (bridge stalled / app throttled)
  *
- * Wire protocol v3, matching BridgeService.java exactly (see that file for
+ * Wire protocol v4, matching BridgeService.java exactly (see that file for
  * the authoritative spec): big-endian ints, mode/width/height/fps/bitrate/
  * codec handshake, then a status reply carrying either the selected codec
  * name (success) or an error message (failure), then length-prefixed chunks
- * each direction, -1 length = EOS.
+ * each direction, -1 length = EOS, and -2 = a decode format record carrying
+ * the picture size that applies to every frame after it.
  */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -437,6 +439,8 @@ static int run_session(const struct session *s) {
 
     long got = 0;
     int rc = RC_OK;
+    /* Picture size most recently announced by a v4 format record. */
+    int det_w = 0, det_h = 0;
     for (;;) {
         int32_t olen;
         if (read_i32(sock, &olen) != 0) {
@@ -449,7 +453,34 @@ static int run_session(const struct session *s) {
             }
             break;
         }
-        if (olen < 0) break;
+        if (olen == -2) {
+            /*
+             * Protocol v4 format record. Decoding is the only case where the
+             * client may not know the picture size up front -- the bitstream
+             * carries it, not the caller -- and the size can legitimately
+             * change part-way through a stream.
+             */
+            int32_t fw, fh;
+            if (read_i32(sock, &fw) != 0 || read_i32(sock, &fh) != 0) {
+                rc = io_timed_out ? RC_TIMEOUT : RC_ERR;
+                if (rc == RC_TIMEOUT) timeout_hint();
+                break;
+            }
+            if (fw != det_w || fh != det_h) {
+                fprintf(stderr, "%s frame size: %dx%d\n",
+                        det_w ? "new" : "detected", fw, fh);
+                det_w = fw;
+                det_h = fh;
+            }
+            continue;
+        }
+        if (olen == -1) break;
+        if (olen < -2) {
+            fprintf(stderr, "protocol error: unexpected record %d "
+                            "(client too old for this bridge?)\n", olen);
+            rc = RC_ERR;
+            break;
+        }
         if (olen > 0) {
             uint8_t *ob = malloc((size_t)olen);
             if (!ob) { rc = RC_ERR; break; }
@@ -479,6 +510,8 @@ static int run_session(const struct session *s) {
     }
 
     fprintf(stderr, "done: sent=%ld units, received=%ld units\n", wargs.sent, got);
+    if (s->mode == 1 && det_w > 0)
+        fprintf(stderr, "output is tightly packed I420 at %dx%d\n", det_w, det_h);
     fflush(fout);
     if (fin != stdin) fclose(fin);
     if (fout != stdout) fclose(fout);
@@ -492,12 +525,14 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "usage:\n"
         "  %s encode [-c CODEC] <w> <h> <fps> <bitrate> <in.yuv420> <out.bs>\n"
-        "  %s decode [-c CODEC] <w> <h> <in.bs> <out.yuv420>\n"
+        "  %s decode [-c CODEC] [<w> <h>] <in.bs> <out.yuv420>\n"
         "  %s info\n"
         "  %s log\n"
         "\n"
         "  CODEC  h264 (default) | hevc | vp9 | av1\n"
         "  \"-\"    as a filename means stdin/stdout\n"
+        "  decode dimensions are optional: the bridge announces the real\n"
+        "  picture size, and reports it again if it changes mid-stream\n"
         "\n"
         "env: BRIDGE_TIMEOUT=%d  BRIDGE_RETRIES=%d  BRIDGE_PORT=%d\n",
         prog, prog, prog, prog, timeout_secs(), retry_count(), bridge_port());
@@ -505,6 +540,11 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return RC_USAGE; }
+
+    /* A bridge that dies or hangs up mid-session must surface as a normal
+     * write error on the next send, not as SIGPIPE killing us with signal 13
+     * before the reader has had a chance to report why. */
+    signal(SIGPIPE, SIG_IGN);
 
     struct session s;
     memset(&s, 0, sizeof(s));
@@ -531,10 +571,21 @@ int main(int argc, char **argv) {
         s.fps = atoi(argv[ai + 2]); s.bitrate = atoi(argv[ai + 3]);
         s.infile = argv[ai + 4]; s.outfile = argv[ai + 5];
     } else if (!strcmp(sub, "decode")) {
-        if (rest != 4) { fprintf(stderr, "decode needs 4 args\n"); usage(argv[0]); return RC_USAGE; }
+        /*
+         * The dimensions are optional for decoding: protocol v4 has the
+         * bridge announce the real picture size, so the common case is to
+         * just name the two files and let the bitstream speak for itself.
+         */
         s.mode = 1;
-        s.width = atoi(argv[ai]); s.height = atoi(argv[ai + 1]);
-        s.infile = argv[ai + 2]; s.outfile = argv[ai + 3];
+        if (rest == 4) {
+            s.width = atoi(argv[ai]); s.height = atoi(argv[ai + 1]);
+            s.infile = argv[ai + 2]; s.outfile = argv[ai + 3];
+        } else if (rest == 2) {
+            s.width = 0; s.height = 0;
+            s.infile = argv[ai]; s.outfile = argv[ai + 1];
+        } else {
+            fprintf(stderr, "decode needs 2 or 4 args\n"); usage(argv[0]); return RC_USAGE;
+        }
     } else if (!strcmp(sub, "info")) {
         s.mode = 2;
     } else if (!strcmp(sub, "log")) {
@@ -545,8 +596,12 @@ int main(int argc, char **argv) {
         return RC_USAGE;
     }
 
-    if ((s.mode == 0 || s.mode == 1) && (s.width <= 0 || s.height <= 0)) {
+    if (s.mode == 0 && (s.width <= 0 || s.height <= 0)) {
         fprintf(stderr, "width and height must be positive\n");
+        return RC_USAGE;
+    }
+    if (s.mode == 1 && (s.width < 0 || s.height < 0)) {
+        fprintf(stderr, "width and height must not be negative\n");
         return RC_USAGE;
     }
 

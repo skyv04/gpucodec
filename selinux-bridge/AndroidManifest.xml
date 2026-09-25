@@ -12,6 +12,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Gap #4 mitigations: bring the bridge back after a reboot or an
+         in-place update, and let the user exempt it from Doze so a long
+         idle period can't quietly stop it. Neither makes the service a
+         real daemon (a force-stop still needs a manual launch), but
+         together they remove the two cases that are recoverable. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="@string/app_name"
@@ -29,6 +36,21 @@
         <service android:name=".BridgeService"
             android:exported="false"
             android:foregroundServiceType="specialUse" />
+
+        <receiver android:name=".BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Some vendor ROMs (including Samsung's) send this instead
+                     of, or ahead of, BOOT_COMPLETED on a quick restart. -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
     </application>
 </manifest>

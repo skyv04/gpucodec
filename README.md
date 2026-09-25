@@ -567,7 +567,7 @@ works identically on a file and on stdin.
 | `bench.c` | early viability benchmark, kept for its CPU-reference DCT check |
 | `cpu_sad.c` | CPU motion-search baseline used to decide against inter coding |
 | `agc_core.h` | the reusable, hardened GPU pipeline — see "Embedding AGC-1" |
-| `ffmpeg/` | `agc1`: AGC-1 as a real `libavcodec` codec for Shotcut/Blender, plus `h264_selinuxbridge`/`hevc_selinuxbridge`, which route ordinary ffmpeg encodes through the hardware block via the bridge APK |
+| `ffmpeg/` | `agc1`: AGC-1 as a real `libavcodec` codec for Shotcut/Blender, plus `h264_selinuxbridge`/`hevc_selinuxbridge` **encoders and decoders**, which route ordinary ffmpeg jobs through the hardware block via the bridge APK |
 | `selinux-bridge/` | verified working: real hardware MediaCodec exposed over loopback from an installed APK, reachable from Debian/PRoot — full encode+decode round trip confirmed, with a device-free regression suite (`tools/selftest`) |
 
 ## Notes for anyone extending this

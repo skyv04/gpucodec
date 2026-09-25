@@ -3,8 +3,10 @@ package com.selinuxbridge.app;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.graphics.Rect;
 import android.media.Image;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
@@ -50,7 +52,7 @@ import java.util.concurrent.TimeUnit;
  * for the transcript): 30-frame encode -> valid H.264 -> decode -> 30
  * frames back, using c2.qti.* hardware codec components.
  *
- * Wire protocol v3 (all integers big-endian / DataInputStream/
+ * Wire protocol v4 (all integers big-endian / DataInputStream/
  * DataOutputStream network order):
  *
  *   Client -> Server, once per connection:
@@ -62,7 +64,8 @@ import java.util.concurrent.TimeUnit;
  *                            which Android scoped storage otherwise hides
  *                            from the Debian side; other fields ignored)
  *     int32 width
- *     int32 height
+ *     int32 height      (decode may send 0 x 0: the real size comes back
+ *                        in a format record, see below)
  *     int32 fps         (encode only, ignored otherwise)
  *     int32 bitrate     (encode only, ignored otherwise)
  *     int32 codec       0 = H.264/AVC, 1 = HEVC/H.265, 2 = VP9, 3 = AV1
@@ -82,6 +85,16 @@ import java.util.concurrent.TimeUnit;
  *                       (length == -1 means end-of-stream, no bytes follow)
  *     Server -> Client: int32 length, then `length` bytes of one output unit
  *                       (length == -1 means end-of-stream, no bytes follow)
+ *
+ *   New in v4, decode only: the server's output stream may carry format
+ *   records, `int32 -2` followed by `int32 width` and `int32 height`. One
+ *   always precedes the first frame, and another is emitted whenever the
+ *   picture size changes mid-stream. Every frame that follows is tightly
+ *   packed I420 at those dimensions. This is what lets a client -- notably
+ *   the libavcodec decoder in ffmpeg/selinuxbridge.c -- learn the real
+ *   picture size without parsing the bitstream, and survive a resolution
+ *   change. Lengths <= -3 are reserved; a client must treat one as a
+ *   protocol error rather than guessing.
  *
  *   For modes 2 and 3, the server sends one or more payload chunks (a text
  *   diagnostics report, or the log file's contents) followed by the -1 EOS
@@ -168,10 +181,25 @@ public class BridgeService extends Service {
                     CHANNEL_ID, "SELinux Hardware Bridge", NotificationManager.IMPORTANCE_LOW);
             nm.createNotificationChannel(ch);
         }
+        /*
+         * Tapping the notification has to reopen the app, because that is the
+         * one recovery the user always has: a force-stopped bridge cannot
+         * restart itself (gap #4), and the notification is the only handle on
+         * it once the app is off-screen.
+         */
+        PendingIntent open = PendingIntent.getActivity(
+                this, 0, new Intent(this, MainActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                                | Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
         return new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("SELinux Hardware Bridge")
                 .setContentText("Hardware MediaCodec bridge on 127.0.0.1:" + PORT)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentIntent(open)
+                .setOngoing(true)
+                .setShowWhen(false)
                 .build();
     }
 
@@ -289,7 +317,7 @@ public class BridgeService extends Service {
         sb.append("device: ").append(Build.MODEL).append(" (" ).append(Build.HARDWARE).append(")\n");
         sb.append("android: ").append(Build.VERSION.RELEASE)
           .append(" (sdk ").append(Build.VERSION.SDK_INT).append(")\n");
-        sb.append("protocol: v3\n");
+        sb.append("protocol: v4\n");
         sb.append("concurrent codec slots: ").append(CODEC_SLOT_LIMIT)
           .append(" (").append(CODEC_SLOTS.availablePermits()).append(" free)\n\n");
 
@@ -400,7 +428,17 @@ public class BridgeService extends Service {
                         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                     } else {
                         codec = selectCodec(mime, false);
-                        MediaFormat fmt = MediaFormat.createVideoFormat(mime, width, height);
+                        /*
+                         * A decode client is allowed not to know the picture
+                         * size -- that is the whole point of the v4 format
+                         * record. MediaFormat still wants something at
+                         * configure() time, and the component overrides it
+                         * from the stream's own parameter sets, so a hint is
+                         * enough.
+                         */
+                        int cfgW = width > 0 ? width : 1920;
+                        int cfgH = height > 0 ? height : 1080;
+                        MediaFormat fmt = MediaFormat.createVideoFormat(mime, cfgW, cfgH);
                         codec.configure(fmt, null, null, 0);
                     }
                 } catch (Exception e) {
@@ -488,6 +526,29 @@ public class BridgeService extends Service {
         return fallback;
     }
 
+    /*
+     * MediaFormat's width/height are the *coded* size, padded up to the
+     * component's macroblock alignment; the display size is the crop
+     * rectangle. getOutputImage() already applies the crop, so these two are
+     * only needed on the fallback ByteBuffer path. The crop keys are
+     * inclusive on both ends, hence the +1.
+     */
+    private static int cropWidth(MediaFormat fmt, int fallback) {
+        if (fmt != null && fmt.containsKey("crop-left") && fmt.containsKey("crop-right")) {
+            int w = formatInt(fmt, "crop-right", 0) - formatInt(fmt, "crop-left", 0) + 1;
+            if (w > 0) return w;
+        }
+        return formatInt(fmt, MediaFormat.KEY_WIDTH, fallback);
+    }
+
+    private static int cropHeight(MediaFormat fmt, int fallback) {
+        if (fmt != null && fmt.containsKey("crop-top") && fmt.containsKey("crop-bottom")) {
+            int h = formatInt(fmt, "crop-bottom", 0) - formatInt(fmt, "crop-top", 0) + 1;
+            if (h > 0) return h;
+        }
+        return formatInt(fmt, MediaFormat.KEY_HEIGHT, fallback);
+    }
+
     /** Synchronous dequeue/enqueue pump. Simple and robust for a bridge process. */
     private void runPump(MediaCodec codec, DataInputStream in, DataOutputStream out,
                          boolean encode, int width, int height, int fps) throws IOException {
@@ -495,6 +556,8 @@ public class BridgeService extends Service {
         boolean outputDone = false;
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         long framesIn = 0, framesOut = 0;
+        /* Last picture size announced to the client via a v4 format record. */
+        int announcedW = -1, announcedH = -1;
 
         /*
          * Rate control is driven entirely by presentation timestamps: queueing
@@ -553,9 +616,13 @@ public class BridgeService extends Service {
             int obIdx = codec.dequeueOutputBuffer(info, 10_000);
             if (obIdx >= 0) {
                 byte[] tmp;
+                int outW = -1, outH = -1;
                 if (!encode && info.size > 0) {
                     Image img = codec.getOutputImage(obIdx);
                     if (img != null) {
+                        Rect crop = img.getCropRect();
+                        outW = crop.width();
+                        outH = crop.height();
                         tmp = I420.toI420(img);
                     } else {
                         ByteBuffer buf = codec.getOutputBuffer(obIdx);
@@ -563,6 +630,10 @@ public class BridgeService extends Service {
                         buf.position(info.offset);
                         buf.limit(info.offset + info.size);
                         buf.get(tmp);
+                        MediaFormat of = null;
+                        try { of = codec.getOutputFormat(obIdx); } catch (Exception ignored) {}
+                        outW = cropWidth(of, width);
+                        outH = cropHeight(of, height);
                     }
                 } else {
                     ByteBuffer buf = codec.getOutputBuffer(obIdx);
@@ -572,6 +643,22 @@ public class BridgeService extends Service {
                         buf.limit(info.offset + info.size);
                         buf.get(tmp);
                     }
+                }
+                /*
+                 * Protocol v4: announce the picture size before the frame it
+                 * applies to, and again whenever it changes. A decode client
+                 * therefore never has to parse the bitstream to size its
+                 * buffers, and a mid-stream resolution change is a normal
+                 * event rather than a stream of mis-sized frames.
+                 */
+                if (!encode && outW > 0 && outH > 0
+                        && (outW != announcedW || outH != announcedH)) {
+                    out.writeInt(-2);
+                    out.writeInt(outW);
+                    out.writeInt(outH);
+                    announcedW = outW;
+                    announcedH = outH;
+                    log("announcing output size " + outW + "x" + outH);
                 }
                 out.writeInt(tmp.length);
                 if (tmp.length > 0) out.write(tmp);

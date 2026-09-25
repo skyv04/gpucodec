@@ -64,12 +64,18 @@ for enc in h264_selinuxbridge hevc_selinuxbridge; do
         *) NEW_FLAGS="$NEW_FLAGS --enable-encoder=$enc" ;;
     esac
 done
+for dec in h264_selinuxbridge hevc_selinuxbridge; do
+    case "$NEW_FLAGS" in
+        *"--enable-decoder=$dec"*) ;;
+        *) NEW_FLAGS="$NEW_FLAGS --enable-decoder=$dec" ;;
+    esac
+done
 
 if [ "$NEW_FLAGS" != "$OLD_FLAGS" ]; then
-    echo "==> Reconfiguring to enable the bridge encoders"
+    echo "==> Reconfiguring to enable the bridge encoders and decoders"
     eval ./configure $NEW_FLAGS
 else
-    echo "==> Already configured with the bridge encoders"
+    echo "==> Already configured with the bridge encoders and decoders"
 fi
 
 echo "==> Building with -j$JOBS (raise AGC1_MAKE_JOBS if you have RAM to spare)"
@@ -79,9 +85,11 @@ make install
 cat <<EOF
 
 ==> Done. Verify with:
-      LD_LIBRARY_PATH=$INSTALL_PREFIX/lib $INSTALL_PREFIX/bin/ffmpeg -encoders | grep selinuxbridge
+      LD_LIBRARY_PATH=$INSTALL_PREFIX/lib $INSTALL_PREFIX/bin/ffmpeg -codecs | grep selinuxbridge
 
     Then, with the SELinux Hardware Bridge app open on-screen:
       LD_LIBRARY_PATH=$INSTALL_PREFIX/lib $INSTALL_PREFIX/bin/ffmpeg \\
           -i input.mp4 -c:v h264_selinuxbridge -b:v 4M output.mp4
+      LD_LIBRARY_PATH=$INSTALL_PREFIX/lib $INSTALL_PREFIX/bin/ffmpeg \\
+          -c:v h264_selinuxbridge -i input.mp4 -f rawvideo output.yuv
 EOF
