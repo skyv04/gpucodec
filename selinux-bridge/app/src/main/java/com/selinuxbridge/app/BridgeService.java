@@ -304,9 +304,22 @@ public class BridgeService extends Service {
         return false;
     }
 
-    private static MediaCodec selectCodec(String mime, boolean encoder) throws IOException {
+    /**
+     * @param rcMode requested rate control for encoders, or -1 to not care
+     *               (decoders, which have no such notion).
+     *
+     * Qualcomm splits rate control across components: c2.qti.hevc.encoder
+     * does CBR and VBR, while constant quality lives on a *separate*
+     * c2.qti.hevc.encoder.cq. Taking the first c2.qti.* match therefore
+     * hands a CQ request to a component that cannot do CQ. So when a mode
+     * is asked for, prefer a component that supports it, while still
+     * defaulting to the first hardware match when nothing does.
+     */
+    private static MediaCodec selectCodec(String mime, boolean encoder, int rcMode)
+            throws IOException {
         MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
         String preferred = null;
+        String rcCapable = null;
         for (MediaCodecInfo info : list.getCodecInfos()) {
             if (info.isEncoder() != encoder) continue;
             boolean supportsMime = false;
@@ -317,13 +330,14 @@ public class BridgeService extends Service {
             String name = info.getName();
             // Qualcomm's real hardware Codec2 components are named
             // "c2.qti.*"; software ones are "c2.android.*"/"OMX.google.*".
-            if (name.toLowerCase(Locale.US).startsWith("c2.qti.")) {
-                preferred = name;
-                break;
-            }
+            if (!name.toLowerCase(Locale.US).startsWith("c2.qti.")) continue;
+            if (preferred == null) preferred = name;
+            if (!encoder || rcMode < 0) break;
+            if (supportsRateMode(info, mime, rcMode)) { rcCapable = name; break; }
         }
-        if (preferred != null) {
-            return MediaCodec.createByCodecName(preferred);
+        String chosen = rcCapable != null ? rcCapable : preferred;
+        if (chosen != null) {
+            return MediaCodec.createByCodecName(chosen);
         }
         return encoder ? MediaCodec.createEncoderByType(mime) : MediaCodec.createDecoderByType(mime);
     }
@@ -344,41 +358,47 @@ public class BridgeService extends Service {
      * a slightly-wrong bitrate beats no encode at all.
      */
     private void applyRateControl(MediaFormat fmt, MediaCodec codec,
-                                  int rcMode, int bitrate) {
-        int mode;
-        switch (rcMode) {
-            case 1:  mode = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR; break;
-            case 2:  mode = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ;  break;
-            default: mode = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR; break;
-        }
+                                  int rcMode, int bitrate) throws IOException {
+        int mode = androidBitrateMode(rcMode);
+        String mime = fmt.getString(MediaFormat.KEY_MIME);
 
         boolean supported = false;
         try {
             MediaCodecInfo.EncoderCapabilities ec = codec.getCodecInfo()
-                    .getCapabilitiesForType(fmt.getString(MediaFormat.KEY_MIME))
-                    .getEncoderCapabilities();
+                    .getCapabilitiesForType(mime).getEncoderCapabilities();
             supported = ec != null && ec.isBitrateModeSupported(mode);
         } catch (Exception e) {
             log("could not query encoder bitrate modes: " + e);
         }
 
-        if (rcMode == 2 && supported) {
+        if (!supported) {
+            /*
+             * Refuse rather than quietly encode in some other mode. Silently
+             * substituting rate control is precisely how gap #14 hid for so
+             * long: the caller asks for one thing, gets another, and only
+             * finds out by measuring the output afterwards. A caller that
+             * asked for CQ and got VBR can overshoot its bitrate several
+             * times over, so this has to be loud.
+             */
+            String have = rateModeList(codec.getCodecInfo(), mime);
+            throw new IOException("rate control '" + rcName(rcMode).toLowerCase(Locale.US)
+                    + "' is not supported by " + codec.getName()
+                    + (have.isEmpty() ? "" : " (supported: " + have + ")"));
+        }
+
+        if (rcMode == 2) {
             /* In CQ the bitrate field carries a quality, not bits/s. */
             int quality = bitrate > 0 ? Math.min(bitrate, 100) : 80;
             fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, mode);
             fmt.setInteger(MediaFormat.KEY_QUALITY, quality);
-            log("rate control: CQ quality=" + quality);
+            log("rate control: CQ quality=" + quality + " on " + codec.getName());
             return;
         }
 
         fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate > 0 ? bitrate : 4_000_000);
-        if (supported) {
-            fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, mode);
-            log("rate control: " + rcName(rcMode) + " at " + (bitrate > 0 ? bitrate : 4_000_000) + " bps");
-        } else {
-            log("rate control: " + rcName(rcMode) + " unsupported by "
-                    + codec.getName() + ", using component default");
-        }
+        fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, mode);
+        log("rate control: " + rcName(rcMode) + " at "
+                + (bitrate > 0 ? bitrate : 4_000_000) + " bps on " + codec.getName());
     }
 
     private static String rcName(int rcMode) {
@@ -391,6 +411,12 @@ public class BridgeService extends Service {
 
     /** " rc: cbr,vbr" -- which rate-control modes this encoder will honour. */
     private static String rateModes(MediaCodecInfo info, String mime) {
+        String list = rateModeList(info, mime);
+        return list.isEmpty() ? "" : "  rc: " + list;
+    }
+
+    /** Comma-separated rate-control modes a component actually supports. */
+    private static String rateModeList(MediaCodecInfo info, String mime) {
         try {
             MediaCodecInfo.EncoderCapabilities ec =
                     info.getCapabilitiesForType(mime).getEncoderCapabilities();
@@ -403,9 +429,28 @@ public class BridgeService extends Service {
             if (ec.isBitrateModeSupported(
                     MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)) m.append("cq,");
             if (m.length() == 0) return "";
-            return "  rc: " + m.substring(0, m.length() - 1);
+            return m.substring(0, m.length() - 1);
         } catch (Exception e) {
             return "";
+        }
+    }
+
+    /** Wire rate-control mode -> MediaCodec BITRATE_MODE_* constant. */
+    private static int androidBitrateMode(int rcMode) {
+        switch (rcMode) {
+            case 1:  return MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR;
+            case 2:  return MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ;
+            default: return MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR;
+        }
+    }
+
+    private static boolean supportsRateMode(MediaCodecInfo info, String mime, int rcMode) {
+        try {
+            MediaCodecInfo.EncoderCapabilities ec =
+                    info.getCapabilitiesForType(mime).getEncoderCapabilities();
+            return ec != null && ec.isBitrateModeSupported(androidBitrateMode(rcMode));
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -577,7 +622,7 @@ public class BridgeService extends Service {
                 MediaCodec codec;
                 try {
                     if (mode == 0) {
-                        codec = selectCodec(mime, true);
+                        codec = selectCodec(mime, true, rcMode);
                         MediaFormat fmt = MediaFormat.createVideoFormat(mime, width, height);
                         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
@@ -586,7 +631,7 @@ public class BridgeService extends Service {
                         fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
                         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                     } else {
-                        codec = selectCodec(mime, false);
+                        codec = selectCodec(mime, false, -1);
                         /*
                          * A decode client is allowed not to know the picture
                          * size -- that is the whole point of the v4 format

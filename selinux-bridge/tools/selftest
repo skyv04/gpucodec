@@ -248,6 +248,36 @@ else
                  || bad "an invalid -r gave the wrong exit code"
 fi
 
+# Qualcomm splits rate control across components -- CQ lives on a separate
+# c2.qti.*.encoder.cq -- so a component that cannot do the requested mode is
+# a real case. It must be refused, never quietly encoded in another mode:
+# that silent substitution is exactly what hid the VBR overshoot (gap #14).
+NORC_PORT=$((PORT + 5))
+MOCK_UNSUPPORTED_RC=cq python3 tools/mock-bridge.py "$NORC_PORT" \
+    >"$TMP/norc.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+if BRIDGE_PORT=$NORC_PORT ./bridge_client encode -r cq \
+        "$W" "$H" 30 60 "$TMP/in.yuv" "$TMP/norc.out" >/dev/null 2>"$TMP/norc.err"; then
+    bad "an unsupported rate-control mode was silently accepted"
+elif grep -qi "not supported" "$TMP/norc.err"; then
+    ok "an unsupported rate-control mode is refused, not silently swapped"
+else
+    bad "an unsupported rate-control mode failed without saying why"
+fi
+
+# ...while a mode the component does support must still go through on the
+# very same bridge, so the check above is not just refusing everything.
+if BRIDGE_PORT=$NORC_PORT ./bridge_client encode -r vbr \
+        "$W" "$H" 30 1000000 "$TMP/okrc.out" >/dev/null 2>&1; then
+    bad "a supported rate-control mode took a malformed command line"
+elif BRIDGE_PORT=$NORC_PORT ./bridge_client encode -r vbr \
+        "$W" "$H" 30 1000000 "$TMP/in.yuv" "$TMP/okrc.out" >/dev/null 2>&1; then
+    ok "a supported rate-control mode still encodes on that same bridge"
+else
+    bad "a supported rate-control mode was wrongly refused"
+fi
+
 head_ "Failure handling"
 
 start=$(date +%s)

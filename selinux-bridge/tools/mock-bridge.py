@@ -22,6 +22,7 @@ stream that corresponds to the input rather than a canned replay.
 
 Usage:  mock-bridge.py [port]           (default 9401)
 Env:    MOCK_RESIZE_AT=N   halve the picture size from decoded frame N on
+        MOCK_UNSUPPORTED_RC=cq[,vbr]  refuse those rate-control modes
 """
 import os
 import socket
@@ -33,6 +34,10 @@ import threading
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9401
 RESIZE_AT = int(os.environ.get("MOCK_RESIZE_AT", "0"))
+# Rate-control modes the pretend component refuses, as "cq" or "vbr,cq".
+# Real Qualcomm parts split these across components (CQ lives on a separate
+# c2.qti.*.encoder.cq), so the refusal path needs covering without a device.
+UNSUPPORTED_RC = {m for m in os.environ.get("MOCK_UNSUPPORTED_RC", "").split(",") if m}
 
 # Wire codec id -> (ffmpeg encoder, decoder demuxer, component name)
 CODECS = {
@@ -263,6 +268,10 @@ def handle(conn):
             conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
         elif rc > 2:
             msg = b"unknown rate-control mode"
+            conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+        elif mode == 0 and RC_NAMES.get(rc) in UNSUPPORTED_RC:
+            msg = ("rate control '%s' is not supported by mock.encoder"
+                   % RC_NAMES.get(rc)).encode()
             conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
         elif mode == 0:
             handle_encode(conn, f, w, h, fps, codec)
