@@ -155,7 +155,7 @@ network-fetched design tooling.
   open-sourced it in 2000), used the same way this repo's own docs already
   refer to it throughout.
 
-## Wire protocol (v4)
+## Wire protocol (v5)
 
 All integers are 4-byte big-endian (`DataInputStream`/`DataOutputStream`
 network order). One TCP connection = one session.
@@ -168,7 +168,7 @@ network order). One TCP connection = one session.
    | `mode` | `0` encode, `1` decode, `2` info, `3` log |
    | `width`/`height` | frame size; decode may send `0 0` and learn the real size from the format record below |
    | `fps`/`bitrate` | encode only; send 0 otherwise |
-   | `codec` | `0` h264, `1` hevc, `2` vp9, `3` av1 — **new in v3** |
+   | `codec` | bits 0–7: `0` h264, `1` hevc, `2` vp9, `3` av1 — **new in v3**.<br>bits 8–15: rate control, encode only — `0` CBR, `1` VBR, `2` CQ — **new in v5**. A v3/v4 client sends a bare `0..3`, so its high bits are zero and it gets CBR, which is the fix for gap #14. In CQ the `bitrate` field carries a quality in 1..100 instead of bits/s. |
 
    Modes 2 and 3 ignore everything after `mode`, but the handshake shape is
    fixed, so dummy values are still sent.
@@ -218,13 +218,18 @@ network order). One TCP connection = one session.
 | v2 | status gained a length-prefixed codec-name/error-message field; added `info` (mode 2) |
 | v3 | added the `codec` handshake field (hevc/vp9/av1) and `log` (mode 3) |
 | v4 | added decode format records (`-2 w h`), so decode dimensions are optional and a mid-stream resolution change is a normal event |
+| v5 | added rate control in the codec field's high byte (CBR/VBR/CQ), fixing a 25–34% bitrate overshoot. The header is unchanged, so this is the one version bump that *is* backward compatible |
 
 Versions are **not** wire-compatible with each other. A v3 client talking to
 a v2 server happens to work for `info` (the extra `codec` int is simply never
 read before the server replies), and a v4 client talking to a v3 server works
 for everything except decode (a v3 server simply never sends a format record,
-so the client has no size to report), but in general encode/decode will
-mis-frame — update both sides together. `bridge_client info` prints the
+so the client has no size to report). v5 is the deliberate exception: it
+reuses spare bits of an existing field rather than adding one, so a v5
+client at its default talks to a v4 server unchanged, and asking a v4
+server for a mode it does not have fails loudly (`unknown codec id 256`)
+instead of being silently ignored — both confirmed on real hardware.
+Otherwise encode/decode will mis-frame — update both sides together. `bridge_client info` prints the
 server's protocol version, which is the quickest way to spot a mismatch.
 
 ### Concurrency limit
@@ -309,7 +314,7 @@ connection and then goes quiet, a bridge that is out of codec slots, a
 semi-planar chroma layout — cannot be arranged reliably on real hardware.
 
 ```sh
-./tools/selftest          # 27 checks, ~3 min
+./tools/selftest          # 30 checks, ~3 min
 ./tools/test-i420         # 10 plane-layout unit tests on a plain JVM
 ```
 
@@ -690,8 +695,9 @@ deliberate Android platform behaviour that no unprivileged app can change.
 | 9 | **Throwaway debug signing key.** `build.sh` wrote `build/debug.keystore`, which its own `rm -rf build` then destroyed, so every rebuild changed the app's signing identity and Android refused to update in place. | Low | ✅ fixed | The key moved to `selinux-bridge/keystore/` (gitignored), outside the wipe. An existing `build/debug.keystore` is migrated automatically before the wipe so already-installed copies keep updating. Two consecutive builds now produce the same certificate digest. |
 | 10 | **Colour was silently destroyed.** Every encode produced a perfect luma plane and garbage chroma (Y PSNR 38 dB, U/V **6.7 dB**) at every resolution. `BridgeService` requested `COLOR_FormatYUV420Flexible` and then blitted the wire bytes straight into the input buffer — but "flexible" does not mean planar I420. On Qualcomm the chroma comes back **semi-planar**, U and V aliasing one region with a pixel stride of 2, and rows padded to the component's own alignment. Found only because a PSNR check happened to print U and V separately; frame counts, bitrate, decodability and luma quality all looked perfectly healthy. | **High** | ✅ fixed | New `I420.java` copies plane by plane through `getInputImage()`/`getOutputImage()`, honouring `getRowStride()` and `getPixelStride()`, so planar, semi-planar and padded layouts are all correct. The same path repacks decoder output into tightly packed I420. Covered by 10 JVM unit tests (`tools/test-i420`). |
 | 11 | **Rate control was inoperative.** Every frame was queued with `presentationTimeUs = 0`, so the encoder believed the whole clip was instantaneous. A 6 Mbps request delivered **2.98 Mbps**. | Medium | ✅ fixed | Frames are now queued at `frameIndex * 1_000_000 / fps` in both directions. |
-| 12 | **No tests, and the ones that mattered were untestable.** Everything was verified by hand against a live phone, so nothing could be checked before an install tap, and failure modes (a bridge that stalls, a bridge that is out of slots, a semi-planar chroma layout) could not be reproduced on demand at all. | Medium | ✅ fixed | `tools/selftest` runs 27 checks with no device attached — client round trips, exit codes, fault injection, flat-memory proof, both ffmpeg encoders **and both decoders**, protocol-v4 format records and mid-stream resolution changes, Annex-B parameter sets, timestamps — plus `tools/test-i420`'s 10 layout cases. `tools/mock-bridge.py` reproduces MediaCodec's awkward behaviour deliberately. |
+| 12 | **No tests, and the ones that mattered were untestable.** Everything was verified by hand against a live phone, so nothing could be checked before an install tap, and failure modes (a bridge that stalls, a bridge that is out of slots, a semi-planar chroma layout) could not be reproduced on demand at all. | Medium | ✅ fixed | `tools/selftest` runs 30 checks with no device attached — client round trips, exit codes, fault injection, flat-memory proof, both ffmpeg encoders **and both decoders**, protocol-v4 format records and mid-stream resolution changes, Annex-B parameter sets, timestamps — plus `tools/test-i420`'s 10 layout cases. `tools/mock-bridge.py` reproduces MediaCodec's awkward behaviour deliberately. |
 | 13 | **Decode could not be wired into libavcodec.** The protocol never carried the decoded picture size, so a libavcodec decoder had no way to size its frames or to notice a resolution change. Callers had to know the dimensions up front and pass them in. | Medium | ✅ fixed | Protocol v4 adds decode format records (`-2 w h`), taken from the output `Image`'s own crop rectangle so they are the display size rather than the macroblock-padded coded size. `bridge_client decode` no longer takes dimensions at all, and `h264_selinuxbridge`/`hevc_selinuxbridge` now exist as decoders. |
+| 14 | **Rate control was inaccurate.** `KEY_BITRATE_MODE` was never set, so Codec2 picked its own default -- VBR on this device's `c2.qti.*.encoder` components, where the requested bitrate is only an average the encoder may exceed freely. An explicit `-b:v` came back **+25% at 2 Mbps, +31% at 6 Mbps and +34% at 12 Mbps**, measured on ordinary content rather than a synthetic worst case. (Distinct from gap #11: that was zero timestamps making the encoder think the clip was instantaneous, which *under*-shot; this is the mode itself.) | Medium | ✅ fixed | Protocol v5 carries a rate-control mode in the **high byte of the codec field**, so the 24-byte header is unchanged and a v3/v4 client -- which sends a bare 0..3 -- lands on the new CBR default automatically. `bridge_client -r cbr\|vbr\|cq`, `hw-transcode -r`, and `ffmpeg -rc_mode cbr\|vbr\|cq`. CQ reinterprets the bitrate field as a quality in 1..100. An unsupported mode falls back to plain `KEY_BIT_RATE` rather than failing the session, and `info` now lists which modes each encoder advertises. |
 
 ## Verification of the fixes
 
@@ -727,7 +733,11 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #7 decode | Mid-stream resolution change under libavfilter | decoder reconfigures, transcode completes |
 | #7 decode | Bridge stalls, `-bridge_timeout` | fails in **4 s** instead of hanging |
 | #4 restart | `aapt2 dump badging` on the shipped APK | `RECEIVE_BOOT_COMPLETED` + `MY_PACKAGE_REPLACED` receiver present, so reboots and in-place updates self-heal |
-| #12 tests | `./tools/selftest` with no device attached | **27 passed, 0 failed** |
+| #14 rate | `-b:v` at 2 / 6 / 12 Mbps through the **VBR** default, real hardware | **+25% / +31% / +34%** over target — the bug, measured |
+| #14 rate | v5 client at its CBR default against a **v4** bridge, real hardware | encodes normally — the high byte is zero, so the header is wire-identical |
+| #14 rate | v5 client with `-r vbr` against a **v4** bridge, real hardware | rejected as `unknown codec id 256` — fails loudly rather than silently ignoring the mode |
+| #14 rate | `-r cbr/vbr/cq` packing, and that an old client defaults to cbr | mode survives the wire without disturbing the codec id |
+| #12 tests | `./tools/selftest` with no device attached | **30 passed, 0 failed** |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm

@@ -73,6 +73,7 @@ typedef struct SBContext {
 
     int port;
     int timeout;
+    int rc_mode;            /* 0 = cbr, 1 = vbr, 2 = cq (encode only) */
 
     int sock;
     int codec_id_wire;      /* 0 = h264, 1 = hevc */
@@ -372,14 +373,32 @@ static av_cold int sb_handshake(AVCodecContext *avctx, SBContext *s, int sock,
     int32_t status, nlen;
     char msg[512];
     const int mode = s->is_decoder ? 1 : 0;
+    int rate_field, codec_field;
+
+    if (s->is_decoder) {
+        rate_field  = 0;
+        codec_field = s->codec_id_wire;
+    } else if (s->rc_mode == 2) {
+        /*
+         * In CQ the bridge reads the rate field as a quality in 1..100.
+         * ffmpeg carries constant-quality requests in global_quality,
+         * scaled by FF_QP2LAMBDA; fall back to a sane mid-high quality
+         * when the caller passed no -q:v at all.
+         */
+        int q = avctx->global_quality / FF_QP2LAMBDA;
+        rate_field  = (q > 0 && q <= 100) ? q : 80;
+        codec_field = s->codec_id_wire | (2 << 8);
+    } else {
+        rate_field  = avctx->bit_rate > 0 ? (int)avctx->bit_rate : 4000000;
+        codec_field = s->codec_id_wire | (s->rc_mode << 8);
+    }
 
     if (sb_write_i32(sock, mode) < 0 ||
         sb_write_i32(sock, avctx->width) < 0 ||
         sb_write_i32(sock, avctx->height) < 0 ||
         sb_write_i32(sock, s->is_decoder ? 0 : fps) < 0 ||
-        sb_write_i32(sock, s->is_decoder ? 0
-                           : (avctx->bit_rate > 0 ? (int)avctx->bit_rate : 4000000)) < 0 ||
-        sb_write_i32(sock, s->codec_id_wire) < 0) {
+        sb_write_i32(sock, rate_field) < 0 ||
+        sb_write_i32(sock, codec_field) < 0) {
         av_log(avctx, AV_LOG_ERROR, "selinuxbridge: handshake write failed\n");
         return AVERROR(EIO);
     }
@@ -1027,6 +1046,14 @@ static int sb_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
 static const AVOption sb_options[] = {
     SB_COMMON_OPTIONS(VE),
+    { "rc_mode", "rate control mode", OFFSET(rc_mode), AV_OPT_TYPE_INT,
+      { .i64 = 0 }, 0, 2, VE, "rc_mode" },
+    { "cbr", "constant bitrate; holds the requested -b:v",
+      0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, VE, "rc_mode" },
+    { "vbr", "variable bitrate; -b:v is an average and may overshoot ~30%",
+      0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, VE, "rc_mode" },
+    { "cq",  "constant quality; uses -q:v (1-100) instead of -b:v",
+      0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, VE, "rc_mode" },
     { NULL }
 };
 

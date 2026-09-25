@@ -143,7 +143,7 @@ else
     bad "encode over stdin/stdout failed"
 fi
 
-head_ "Protocol v4"
+head_ "Protocol v4/v5"
 
 # The whole point of the format record: a decode client no longer has to know
 # the picture size, and gets told if it changes part-way through.
@@ -183,10 +183,10 @@ else
     bad "decode against the resizing mock failed"
 fi
 
-if BRIDGE_PORT=$PORT ./bridge_client info 2>/dev/null | grep -q "protocol: v4"; then
-    ok "info reports protocol v4"
+if BRIDGE_PORT=$PORT ./bridge_client info 2>/dev/null | grep -q "protocol: v5"; then
+    ok "info reports protocol v5"
 else
-    bad "info did not report protocol v4"
+    bad "info did not report protocol v5"
 fi
 
 # A client that does not understand a future record type must say so rather
@@ -213,6 +213,39 @@ if [ "$rc" -eq 1 ] && grep -q "protocol error" "$TMP/bogus.err"; then
     ok "an unknown record type is refused as a protocol error"
 else
     bad "an unknown record type gave rc=$rc without a protocol error"
+fi
+
+# v5 carries the rate-control mode in the codec field's high byte. The mock
+# echoes what it parsed, which is the only way to prove the packing and the
+# masking agree without a device.
+for rc_name in cbr vbr cq; do
+    BRIDGE_PORT=$PORT ./bridge_client encode -c hevc -r "$rc_name" \
+        "$W" "$H" 30 1000000 "$TMP/in.yuv" "$TMP/rc.out" >/dev/null 2>&1
+done
+if grep -q "codec=1 rc=cbr" "$TMP/mock.log" \
+   && grep -q "codec=1 rc=vbr" "$TMP/mock.log" \
+   && grep -q "codec=1 rc=cq"  "$TMP/mock.log"; then
+    ok "-r cbr/vbr/cq packs into the codec field without disturbing the codec id"
+else
+    bad "rate-control packing did not survive the wire"
+fi
+
+# An old client sends a bare 0..3, so its high bits are zero and it must
+# still be understood -- and must land on the corrected CBR default.
+if BRIDGE_PORT=$PORT ./bridge_client encode "$W" "$H" 30 1000000 \
+        "$TMP/in.yuv" "$TMP/rc0.out" >/dev/null 2>&1 \
+   && grep -q "codec=0 rc=cbr" "$TMP/mock.log"; then
+    ok "a client that sends no -r defaults to cbr"
+else
+    bad "the default rate-control mode is not cbr"
+fi
+
+if BRIDGE_PORT=$PORT ./bridge_client encode -r bogus \
+        "$W" "$H" 30 1000000 "$TMP/in.yuv" "$TMP/rcx.out" >/dev/null 2>&1; then
+    bad "an invalid -r was accepted"
+else
+    [ $? -eq 2 ] && ok "an invalid -r is a usage error" \
+                 || bad "an invalid -r gave the wrong exit code"
 fi
 
 head_ "Failure handling"

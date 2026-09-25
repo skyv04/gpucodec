@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mock SELinux Hardware Bridge speaking protocol v4.
+Mock SELinux Hardware Bridge speaking protocol v5.
 
 Lets bridge_client, the ffmpeg codecs and any other consumer be tested on a
 machine with no phone attached, and lets the awkward parts of MediaCodec's
@@ -39,6 +39,9 @@ CODECS = {
     0: ("libx264", "h264", b"c2.mock.avc"),
     1: ("libx265", "hevc", b"c2.mock.hevc"),
 }
+
+# v5 rate-control modes, carried in the codec field's high byte.
+RC_NAMES = {0: "cbr", 1: "vbr", 2: "cq"}
 
 
 def split_nals(buf):
@@ -123,7 +126,7 @@ def probe_dimensions(path):
 INFO_REPORT = (
     "SELinux Hardware Bridge diagnostics (mock)\n"
     "device: mock (mock)\n"
-    "protocol: v4\n"
+    "protocol: v5\n"
     "concurrent codec slots: 3 (3 free)\n"
 )
 
@@ -182,7 +185,7 @@ def handle_encode(conn, f, w, h, fps, codec):
 
 def handle_decode(conn, f, codec):
     """
-    Decode side, protocol v4.
+    Decode side, protocol v4 format records.
 
     Real MediaCodec discovers the picture size from the stream's parameter
     sets, not from the client, so this deliberately ignores the handshake's
@@ -242,9 +245,12 @@ def handle(conn):
     if not hdr or len(hdr) < 24:
         conn.close()
         return
-    mode, w, h, fps, br, codec = struct.unpack(">6i", hdr)
-    print(f"[mock] mode={mode} {w}x{h} fps={fps} br={br} codec={codec}",
-          flush=True)
+    mode, w, h, fps, br, codec_field = struct.unpack(">6i", hdr)
+    # v5 packs the rate-control mode into the high byte of the codec field.
+    codec = codec_field & 0xff
+    rc = (codec_field >> 8) & 0xff
+    print(f"[mock] mode={mode} {w}x{h} fps={fps} br={br} codec={codec} "
+          f"rc={RC_NAMES.get(rc, rc)}", flush=True)
 
     try:
         if mode in (2, 3):
@@ -254,6 +260,9 @@ def handle(conn):
             conn.sendall(struct.pack(">i", -1))
         elif codec not in CODECS:
             msg = b"unsupported codec id"
+            conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
+        elif rc > 2:
+            msg = b"unknown rate-control mode"
             conn.sendall(struct.pack(">ii", 1, len(msg)) + msg)
         elif mode == 0:
             handle_encode(conn, f, w, h, fps, codec)
@@ -273,7 +282,7 @@ def main():
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("127.0.0.1", PORT))
     s.listen(8)
-    print(f"[mock] v4 bridge listening on 127.0.0.1:{PORT}", flush=True)
+    print(f"[mock] v5 bridge listening on 127.0.0.1:{PORT}", flush=True)
     while True:
         c, _ = s.accept()
         threading.Thread(target=handle, args=(c,), daemon=True).start()

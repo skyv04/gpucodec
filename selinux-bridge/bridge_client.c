@@ -9,7 +9,7 @@
  * See README.md for full context and the verified test transcript.
  *
  * Usage:
- *   bridge_client encode [-c CODEC] <w> <h> <fps> <bitrate> <in.yuv420> <out.bs>
+ *   bridge_client encode [-c CODEC] [-r RC] <w> <h> <fps> <bitrate> <in.yuv420> <out.bs>
  *   bridge_client decode [-c CODEC] [<w> <h>] <in.bs> <out.yuv420>
  *   bridge_client info
  *   bridge_client log
@@ -25,7 +25,7 @@
  * Exit codes:
  *   0 ok   1 error   2 usage   3 timed out (bridge stalled / app throttled)
  *
- * Wire protocol v4, matching BridgeService.java exactly (see that file for
+ * Wire protocol v5, matching BridgeService.java exactly (see that file for
  * the authoritative spec): big-endian ints, mode/width/height/fps/bitrate/
  * codec handshake, then a status reply carrying either the selected codec
  * name (success) or an error message (failure), then length-prefixed chunks
@@ -148,6 +148,19 @@ static const struct { const char *name; int id; } CODECS[] = {
 static int codec_id_for(const char *name) {
     for (int i = 0; CODECS[i].name; i++)
         if (!strcmp(CODECS[i].name, name)) return CODECS[i].id;
+    return -1;
+}
+
+/*
+ * Rate control, encode only, new in protocol v5. It travels in the high
+ * byte of the codec field, so a v3/v4 bridge -- which masks nothing and
+ * compares the whole int against 0..3 -- rejects it loudly instead of
+ * silently ignoring it.
+ */
+static int rc_mode_for(const char *name) {
+    if (!strcmp(name, "cbr")) return 0;
+    if (!strcmp(name, "vbr")) return 1;
+    if (!strcmp(name, "cq"))  return 2;
     return -1;
 }
 
@@ -334,6 +347,7 @@ struct session {
     int mode;
     int width, height, fps, bitrate;
     int codec;
+    int rc_mode;
     const char *infile, *outfile;
 };
 
@@ -373,7 +387,7 @@ static int run_session(const struct session *s) {
         write_i32(sock, s->height) != 0 ||
         write_i32(sock, s->fps) != 0 ||
         write_i32(sock, s->bitrate) != 0 ||
-        write_i32(sock, s->codec) != 0) {
+        write_i32(sock, s->codec | (s->rc_mode << 8)) != 0) {
         fprintf(stderr, "failed to send handshake\n");
         close(sock);
         return io_timed_out ? RC_TIMEOUT : RC_ERR;
@@ -524,12 +538,16 @@ static int run_session(const struct session *s) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "usage:\n"
-        "  %s encode [-c CODEC] <w> <h> <fps> <bitrate> <in.yuv420> <out.bs>\n"
+        "  %s encode [-c CODEC] [-r RC] <w> <h> <fps> <bitrate> <in.yuv420> <out.bs>\n"
         "  %s decode [-c CODEC] [<w> <h>] <in.bs> <out.yuv420>\n"
         "  %s info\n"
         "  %s log\n"
         "\n"
         "  CODEC  h264 (default) | hevc | vp9 | av1\n"
+        "  RC     cbr (default) | vbr | cq   (encode only)\n"
+        "         cbr holds the requested bitrate; vbr treats it as an\n"
+        "         average and can overshoot by ~30%%; cq reads <bitrate>\n"
+        "         as a quality in 1..100 instead\n"
         "  \"-\"    as a filename means stdin/stdout\n"
         "  decode dimensions are optional: the bridge announces the real\n"
         "  picture size, and reports it again if it changes mid-stream\n"
@@ -553,14 +571,29 @@ int main(int argc, char **argv) {
     const char *sub = argv[1];
     int ai = 2;
 
-    /* Optional "-c CODEC" directly after the subcommand. */
-    if (argc >= 4 && !strcmp(argv[2], "-c")) {
-        s.codec = codec_id_for(argv[3]);
-        if (s.codec < 0) {
-            fprintf(stderr, "unknown codec '%s' (want h264, hevc, vp9 or av1)\n", argv[3]);
+    /* Flags between the subcommand and its positional args, in any order. */
+    while (ai + 1 < argc && argv[ai][0] == '-' && argv[ai][1] != '\0'
+           && strcmp(argv[ai], "-")) {
+        if (!strcmp(argv[ai], "-c")) {
+            s.codec = codec_id_for(argv[ai + 1]);
+            if (s.codec < 0) {
+                fprintf(stderr, "unknown codec '%s' (want h264, hevc, vp9 or av1)\n",
+                        argv[ai + 1]);
+                return RC_USAGE;
+            }
+        } else if (!strcmp(argv[ai], "-r")) {
+            s.rc_mode = rc_mode_for(argv[ai + 1]);
+            if (s.rc_mode < 0) {
+                fprintf(stderr, "unknown rate control '%s' (want cbr, vbr or cq)\n",
+                        argv[ai + 1]);
+                return RC_USAGE;
+            }
+        } else {
+            fprintf(stderr, "unknown flag '%s'\n", argv[ai]);
+            usage(argv[0]);
             return RC_USAGE;
         }
-        ai = 4;
+        ai += 2;
     }
     int rest = argc - ai;
 

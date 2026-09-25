@@ -22,13 +22,16 @@ set -eu
 
 usage() {
     cat >&2 <<'EOF'
-usage: hw-transcode [-c CODEC] [-D] <in> <out.mp4> [width height fps bitrate]
+usage: hw-transcode [-c CODEC] [-r RC] [-D] <in> <out.mp4> [width height fps bitrate]
 
 Decodes <in> with ffmpeg, re-encodes the raw frames on-device through the
 real Qualcomm hardware encoder (via the SELinux Hardware Bridge app), and remuxes
 the result to <out.mp4>.
 
   -c CODEC   h264 (default) or hevc
+  -r RC      cbr (default) | vbr | cq. Leaving rate control unset made
+             Codec2 pick VBR, which overshot an explicit bitrate by 25-34%;
+             cbr holds it. With cq, <bitrate> is a quality in 1..100.
   -D         decode on the hardware block too (needs \$FFMPEG built with the
              selinuxbridge decoders); makes the transcode hardware end to end
 
@@ -39,12 +42,14 @@ EOF
 }
 
 codec=h264
+rcmode=cbr
 hwdec=0
 FFMPEG=${FFMPEG:-ffmpeg}
 FFPROBE=${FFPROBE:-ffprobe}
 while [ $# -gt 0 ]; do
     case ${1:-} in
         -c) [ $# -ge 2 ] || usage; codec=$2; shift 2 ;;
+        -r) [ $# -ge 2 ] || usage; rcmode=$2; shift 2 ;;
         -D|--hw-decode) hwdec=1; shift ;;
         *) break ;;
     esac
@@ -57,6 +62,11 @@ case $codec in
     h264) container_fmt=h264 ;;
     hevc|h265) codec=hevc; container_fmt=hevc ;;
     *) echo "hw-transcode: -c must be h264 or hevc (got '$codec')" >&2; exit 2 ;;
+esac
+
+case $rcmode in
+    cbr|vbr|cq) ;;
+    *) echo "hw-transcode: -r must be cbr, vbr or cq (got '$rcmode')" >&2; exit 2 ;;
 esac
 
 BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -109,7 +119,7 @@ fi
 tmp_bs=$(mktemp --suffix=".$container_fmt")
 trap 'rm -f "$tmp_bs"' EXIT
 
-echo "hw-transcode: ${width}x${height} @ ${fps}fps, bitrate=${bitrate}, codec=${codec} -> hardware encoder" >&2
+echo "hw-transcode: ${width}x${height} @ ${fps}fps, bitrate=${bitrate}, codec=${codec}, rc=${rcmode} -> hardware encoder" >&2
 
 # Piping straight from ffmpeg keeps memory flat regardless of clip length,
 # but it also means bridge_client cannot auto-retry a transient stall (stdin
@@ -117,7 +127,7 @@ echo "hw-transcode: ${width}x${height} @ ${fps}fps, bitrate=${bitrate}, codec=${
 # swallowed by the pipeline.
 set +e
 "$FFMPEG" -v error $DEC_ARGS -i "$in" -f rawvideo -pix_fmt yuv420p -s "${width}x${height}" -r "$fps" - \
-  | "$CLIENT" encode -c "$codec" "$width" "$height" "$fps" "$bitrate" - "$tmp_bs"
+  | "$CLIENT" encode -c "$codec" -r "$rcmode" "$width" "$height" "$fps" "$bitrate" - "$tmp_bs"
 rc=$?
 set -e
 if [ "$rc" -eq 3 ]; then

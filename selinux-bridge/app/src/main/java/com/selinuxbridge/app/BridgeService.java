@@ -52,7 +52,7 @@ import java.util.concurrent.TimeUnit;
  * for the transcript): 30-frame encode -> valid H.264 -> decode -> 30
  * frames back, using c2.qti.* hardware codec components.
  *
- * Wire protocol v4 (all integers big-endian / DataInputStream/
+ * Wire protocol v5 (all integers big-endian / DataInputStream/
  * DataOutputStream network order):
  *
  *   Client -> Server, once per connection:
@@ -68,8 +68,18 @@ import java.util.concurrent.TimeUnit;
  *                        in a format record, see below)
  *     int32 fps         (encode only, ignored otherwise)
  *     int32 bitrate     (encode only, ignored otherwise)
- *     int32 codec       0 = H.264/AVC, 1 = HEVC/H.265, 2 = VP9, 3 = AV1
- *                        (new in v3; encode/decode only, ignored otherwise)
+ *     int32 codec       bits 0-7:  0 = H.264/AVC, 1 = HEVC/H.265, 2 = VP9,
+ *                                  3 = AV1 (new in v3)
+ *                       bits 8-15: rate-control mode, encode only, new in
+ *                                  v5. 0 = CBR, 1 = VBR, 2 = CQ (in which
+ *                                  case the `bitrate` field above carries a
+ *                                  quality in 1..100 rather than bits/s).
+ *                                  A v3/v4 client sends 0..3 here, so its
+ *                                  high bits are zero and it gets CBR --
+ *                                  which is the point: leaving the mode
+ *                                  unset made Codec2 pick VBR, and an
+ *                                  explicit `-b:v 6M` then came back
+ *                                  25-34% over target at every bitrate.
  *
  *   Server -> Client, once:
  *     int32 status      0 = ok, nonzero = failed
@@ -311,13 +321,94 @@ public class BridgeService extends Service {
         return encoder ? MediaCodec.createEncoderByType(mime) : MediaCodec.createDecoderByType(mime);
     }
 
+    /**
+     * Apply the requested rate-control mode to an encoder format.
+     *
+     * Leaving KEY_BITRATE_MODE unset is not neutral: Codec2 then picks its
+     * own default, which on this device's c2.qti.*.encoder components is
+     * VBR, where the requested bitrate is only an average the encoder may
+     * exceed freely. Measured on real hardware that overshot an explicit
+     * request by +25% at 2 Mbps, +31% at 6 Mbps and +34% at 12 Mbps -- on
+     * ordinary content, not a synthetic worst case. Anyone passing
+     * `-b:v 6M` means 6 Mbps, so CBR is the default here.
+     *
+     * Not every component advertises every mode, so an unsupported request
+     * falls back to plain KEY_BIT_RATE rather than failing the session:
+     * a slightly-wrong bitrate beats no encode at all.
+     */
+    private void applyRateControl(MediaFormat fmt, MediaCodec codec,
+                                  int rcMode, int bitrate) {
+        int mode;
+        switch (rcMode) {
+            case 1:  mode = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR; break;
+            case 2:  mode = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ;  break;
+            default: mode = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR; break;
+        }
+
+        boolean supported = false;
+        try {
+            MediaCodecInfo.EncoderCapabilities ec = codec.getCodecInfo()
+                    .getCapabilitiesForType(fmt.getString(MediaFormat.KEY_MIME))
+                    .getEncoderCapabilities();
+            supported = ec != null && ec.isBitrateModeSupported(mode);
+        } catch (Exception e) {
+            log("could not query encoder bitrate modes: " + e);
+        }
+
+        if (rcMode == 2 && supported) {
+            /* In CQ the bitrate field carries a quality, not bits/s. */
+            int quality = bitrate > 0 ? Math.min(bitrate, 100) : 80;
+            fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, mode);
+            fmt.setInteger(MediaFormat.KEY_QUALITY, quality);
+            log("rate control: CQ quality=" + quality);
+            return;
+        }
+
+        fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate > 0 ? bitrate : 4_000_000);
+        if (supported) {
+            fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, mode);
+            log("rate control: " + rcName(rcMode) + " at " + (bitrate > 0 ? bitrate : 4_000_000) + " bps");
+        } else {
+            log("rate control: " + rcName(rcMode) + " unsupported by "
+                    + codec.getName() + ", using component default");
+        }
+    }
+
+    private static String rcName(int rcMode) {
+        switch (rcMode) {
+            case 1:  return "VBR";
+            case 2:  return "CQ";
+            default: return "CBR";
+        }
+    }
+
+    /** " rc: cbr,vbr" -- which rate-control modes this encoder will honour. */
+    private static String rateModes(MediaCodecInfo info, String mime) {
+        try {
+            MediaCodecInfo.EncoderCapabilities ec =
+                    info.getCapabilitiesForType(mime).getEncoderCapabilities();
+            if (ec == null) return "";
+            StringBuilder m = new StringBuilder();
+            if (ec.isBitrateModeSupported(
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)) m.append("cbr,");
+            if (ec.isBitrateModeSupported(
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)) m.append("vbr,");
+            if (ec.isBitrateModeSupported(
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)) m.append("cq,");
+            if (m.length() == 0) return "";
+            return "  rc: " + m.substring(0, m.length() - 1);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     private static String infoReport() {
         StringBuilder sb = new StringBuilder();
         sb.append("SELinux Hardware Bridge diagnostics\n");
         sb.append("device: ").append(Build.MODEL).append(" (" ).append(Build.HARDWARE).append(")\n");
         sb.append("android: ").append(Build.VERSION.RELEASE)
           .append(" (sdk ").append(Build.VERSION.SDK_INT).append(")\n");
-        sb.append("protocol: v4\n");
+        sb.append("protocol: v5\n");
         sb.append("concurrent codec slots: ").append(CODEC_SLOT_LIMIT)
           .append(" (").append(CODEC_SLOTS.availablePermits()).append(" free)\n\n");
 
@@ -343,7 +434,9 @@ public class BridgeService extends Service {
                 String kind = info.isEncoder() ? "encoder" : "decoder";
                 boolean hw = info.getName().toLowerCase(Locale.US).startsWith("c2.qti.");
                 sb.append("  ").append(kind).append(": ").append(info.getName())
-                  .append(hw ? " [hardware]" : "").append("\n");
+                  .append(hw ? " [hardware]" : "");
+                if (info.isEncoder()) sb.append(rateModes(info, mimes[i]));
+                sb.append("\n");
             }
             if (!any) sb.append("  (none)\n");
             sb.append("\n");
@@ -361,7 +454,9 @@ public class BridgeService extends Service {
             int height = in.readInt();
             int fps = in.readInt();
             int bitrate = in.readInt();
-            int codecId = in.readInt();
+            int codecField = in.readInt();
+            int codecId = codecField & 0xff;
+            int rcMode = (codecField >> 8) & 0xff;
 
             if (mode == 2) {
                 writeOkStatus(out, "n/a");
@@ -390,6 +485,11 @@ public class BridgeService extends Service {
             if (mime == null) {
                 writeErrorStatus(out, "unknown codec id " + codecId
                         + " (expected 0=h264, 1=hevc, 2=vp9, 3=av1)");
+                return;
+            }
+            if (rcMode > 2) {
+                writeErrorStatus(out, "unknown rate-control mode " + rcMode
+                        + " (expected 0=cbr, 1=vbr, 2=cq)");
                 return;
             }
 
@@ -422,7 +522,7 @@ public class BridgeService extends Service {
                         MediaFormat fmt = MediaFormat.createVideoFormat(mime, width, height);
                         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
-                        fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate > 0 ? bitrate : 4_000_000);
+                        applyRateControl(fmt, codec, rcMode, bitrate);
                         fmt.setInteger(MediaFormat.KEY_FRAME_RATE, fps > 0 ? fps : 30);
                         fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
                         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
