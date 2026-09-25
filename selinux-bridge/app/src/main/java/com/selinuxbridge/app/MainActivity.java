@@ -356,12 +356,39 @@ public class MainActivity extends Activity {
     }
 
     private View footer() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+
+        /*
+         * Which bridge is actually running, on screen. An in-place update
+         * does not reliably restart the service (see gap #15), so "what is
+         * installed" and "what is answering" can differ, and the build stamp
+         * is the quickest way to tell.
+         *
+         * Deliberately not setTextIsSelectable: that makes the view
+         * focusable, and a focusable view inside a ScrollView can take
+         * initial focus and open the page scrolled down to it. Use
+         * "bridge_client info" when the text needs copying.
+         */
+        TextView ver = new TextView(this);
+        ver.setText(BridgeService.versionLine());
+        ver.setTextColor(ACCENT);
+        ver.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        ver.setGravity(Gravity.CENTER);
+        ver.setTypeface(android.graphics.Typeface.MONOSPACE);
+        box.addView(ver);
+
         TextView tv = new TextView(this);
         tv.setText("github.com/skyv04/gpucodec");
         tv.setTextColor(TEXT_DIM);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         tv.setGravity(Gravity.CENTER);
-        return tv;
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(6);
+        box.addView(tv, lp);
+        return box;
     }
 
     // ---- small helpers --------------------------------------------------

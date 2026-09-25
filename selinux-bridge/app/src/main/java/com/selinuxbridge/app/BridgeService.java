@@ -127,6 +127,29 @@ public class BridgeService extends Service {
     private static final int CODEC_SLOT_LIMIT = maxConcurrentInstances();
     private static final Semaphore CODEC_SLOTS = new Semaphore(CODEC_SLOT_LIMIT, true);
 
+    /**
+     * Single source of truth for the wire version. The app footer and the
+     * "info" report both read it, so what the screen claims and what the
+     * bridge answers cannot drift apart.
+     */
+    static final int PROTOCOL_VERSION = 5;
+
+    /**
+     * Build time of this code. Seconds are kept: iterating on the bridge
+     * easily produces two builds inside the same minute, and this string is
+     * the only thing that tells them apart. The app footer shows the same
+     * value so it can be compared with "info" directly.
+     */
+    static String buildStamp() {
+        return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                .format(new Date(BuildStamp.BUILD_TIME));
+    }
+
+    /** One line naming exactly which bridge is running, for the app footer. */
+    static String versionLine() {
+        return "protocol v" + PROTOCOL_VERSION + "  \u00B7  build " + buildStamp();
+    }
+
     /** Sessions holding a codec right now. Used to refuse an unsafe restart. */
     static int activeSessions() {
         return CODEC_SLOT_LIMIT - CODEC_SLOTS.availablePermits();
@@ -515,11 +538,10 @@ public class BridgeService extends Service {
         sb.append("device: ").append(Build.MODEL).append(" (" ).append(Build.HARDWARE).append(")\n");
         sb.append("android: ").append(Build.VERSION.RELEASE)
           .append(" (sdk ").append(Build.VERSION.SDK_INT).append(")\n");
-        sb.append("protocol: v5\n");
+        sb.append("protocol: v").append(PROTOCOL_VERSION).append("\n");
         // Names the build actually answering, which is the quickest way to
         // tell an update that took effect from one that did not.
-        sb.append("build: ").append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-                .format(new Date(BuildStamp.BUILD_TIME))).append("\n");
+        sb.append("build: ").append(buildStamp()).append("\n");
         String stale = staleProcessWarning(this);
         if (stale != null) sb.append(stale);
         sb.append("concurrent codec slots: ").append(CODEC_SLOT_LIMIT)
