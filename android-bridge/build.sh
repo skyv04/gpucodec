@@ -60,6 +60,6 @@ java -cp "$BT_JAVA/lib/apksigner.jar" com.android.apksigner.ApkSignerTool sign \
   build/apk_unsigned/aligned.apk
 
 echo "[7/7] compiling loopback test client"
-gcc -O2 -Wall bridge_client.c -o bridge_client
+gcc -O2 -Wall bridge_client.c -o bridge_client -lpthread
 
 echo "done: build/apk_final/gpucodec-bridge.apk and ./bridge_client"

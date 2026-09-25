@@ -103,7 +103,7 @@ Once the app is installed and open on-screen:
 # encode: 320x180 raw NV12/I420 frames -> H.264 Annex B
 ./bridge_client encode 320 180 30 2000000 in.yuv420 out.h264
 
-# decode: a full H.264 elementary stream -> raw YUV420 frames (concatenated)
+# decode: an H.264 elementary stream -> raw YUV420 frames (concatenated)
 ./bridge_client decode 320 180 in.h264 out.yuv420
 ```
 
@@ -116,10 +116,43 @@ codec = c2.qti.avc.encoder
 
 If the codec name starts with `c2.qti.`, that's Qualcomm's real hardware
 Codec2 component doing the work — not software (`c2.android.*`) and not
-AGC-1. That single log line is the answer to "does a real APK unlock the
-hardware codec": if it's there and frames flow, yes; if the app crashes or
-`codec` prints a software name, more work is needed (e.g. explicit codec
-selection via `MediaCodecList`).
+AGC-1.
+
+### Verified result (this device, this session)
+
+Installed via sideload (`/sdcard/Download/gpucodec-bridge.apk`, after fixing
+a Play Protect "unsafe app" block caused by a missing `targetSdkVersion` —
+see git history), launched, left open. From the Debian/PRoot side:
+
+```
+$ ./bridge_client encode 320 180 30 2000000 test.yuv420 out.h264
+handshake ok, codec configured on-device
+done: sent=30 units, received=31 units       # 30 frames + EOS marker
+
+$ ffprobe out.h264
+codec_name=h264, width=320, height=180        # a real, valid H.264 stream
+
+$ ./bridge_client decode 320 180 out.h264 redecoded.yuv420
+handshake ok, codec configured on-device
+done: sent=32 units, received=30 units       # SPS+PPS+30 slices in, 30 frames out
+```
+
+Full round trip: raw frames → real hardware H.264 encode → real hardware
+decode → 30 frames back out, over a loopback socket from a normal Debian
+process. The decoded output arrived as 110,528 bytes/frame rather than the
+tightly-packed 86,400 (`320*180*1.5`) — that's stride/slice-height padding,
+a hallmark of Qualcomm's actual hardware decode output layout (software
+reference decoders return tightly-packed frames). Fixed one real client-side
+bug along the way (see `bridge_client.c` comments): a naive
+write-frame-then-wait-for-its-reply loop deadlocks against MediaCodec's
+lookahead latency, and sending a whole elementary stream as a single decode
+input unit only returns a fraction of the frames — both fixed by splitting
+Annex-B NALs individually and decoupling send/receive onto a writer thread.
+
+**Conclusion: confirmed.** A real, installed, signed APK gets a normal
+Zygote-forked app identity that unlocks the hardware codec the Termux/PRoot
+shell is denied. This is not inference — it is a directly observed,
+reproducible encode+decode round trip on this exact device.
 
 ## What this does *not* solve
 
