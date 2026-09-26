@@ -12,7 +12,7 @@
 # bug worth catching here was in the interaction between a real application
 # and a real camera, not in anything a stub would exercise.
 #
-# Usage: native/run-tests [ffmpeg|twoopen|reacq|vlc|udev]...   (default: all)
+# Usage: native/run-tests [ffmpeg|twoopen|reacq|dupfd|vlc|udev]...  (default: all)
 #
 set -uo pipefail
 
@@ -78,6 +78,22 @@ t_reacq() {
     fi
 }
 
+# A dup() shares one file description, so both numbers are the same handle.
+# GStreamer's v4l2src relies on this: it allocates on the original and
+# streams on a duplicate.
+t_dupfd() {
+    echo "duplicated handle (the pattern GStreamer's v4l2src uses)"
+    cc -O2 -o "$TMP/dupfd" "$HERE/tests/dupfd.c" || { bad "build"; return; }
+    local out
+    out="$(LD_PRELOAD="$SHIM" timeout 180 "$TMP/dupfd" 2>&1)"
+    if printf '%s' "$out" | grep -q "^PASS"; then
+        ok "streams on the dup, survives closing either reference"
+    else
+        bad "duplicated handle not recognised"
+        printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+    fi
+}
+
 # libv4l2 issues raw syscalls rather than calling libc, so this is the only
 # test that exercises the syscall() interposer.
 t_vlc() {
@@ -121,6 +137,7 @@ run() {
         ffmpeg)  t_ffmpeg ;;
         twoopen) t_twoopen ;;
         reacq)   t_reacq ;;
+        dupfd)   t_dupfd ;;
         vlc)     t_vlc ;;
         udev)    t_udev ;;
         *) echo "unknown test: $1" >&2; exit 2 ;;
@@ -130,7 +147,7 @@ run() {
 if [ "$#" -gt 0 ]; then
     for t in "$@"; do run "$t"; done
 else
-    for t in ffmpeg twoopen reacq vlc udev; do run "$t"; done
+    for t in ffmpeg twoopen reacq dupfd vlc udev; do run "$t"; done
 fi
 
 echo ""

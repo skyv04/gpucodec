@@ -138,7 +138,7 @@ After that, in any new shell:
 
 | You want | You run | What it uses |
 |---|---|---|
-| The camera | `ffmpeg -f v4l2 -i /dev/video0 …`, `vlc v4l2:///dev/video0`, `getUserMedia` in a browser | `/dev/video0` |
+| The camera | `ffmpeg -f v4l2 -i /dev/video0 …`, `vlc v4l2:///dev/video0`, `gst-launch-1.0 v4l2src`, `getUserMedia` in a browser | `/dev/video0` |
 | The microphone | anything that records | the default PulseAudio source, `phone_mic` |
 | The GPU | anything OpenGL; Chromium and Electron apps just start | Turnip + Zink; `pci-shim` for browsers |
 | Hardware codecs | `ffmpeg -c:v h264_selinuxbridge …` | `ffmpeg` on `PATH` |
@@ -574,7 +574,7 @@ work; they are no longer the recommended route.
 ### Interposing libc: what actually goes wrong
 
 The idea — answer the calls a V4L2 client makes — is a paragraph. Making it
-survive contact with real applications took ten distinct bugs, and they are
+survive contact with real applications took twelve distinct bugs, and they are
 recorded here because every one of them presented as something other than
 what it was.
 
@@ -590,8 +590,9 @@ what it was.
 | 8 | Chromium reported `NotFoundError` and dropped the camera | Returning `EBUSY` to a *second* `open()` looks honest and is wrong: the kernel allows many opens and makes only streaming exclusive, and Chromium probes capabilities while other tabs capture. |
 | 9 | A live capture was torn down by an unrelated `close(-1)` | Dropping an `fd >= 0` guard makes `close(-1)` compare equal to `C.fd == -1`. |
 | 10 | Heap corruption, then total silence | `stop_stream()` was gated on `C.streaming` alone, so a second caller returned early while the pump thread was still alive — and the next line freed the buffers it was still `memcpy()`ing into. Gate on the pump, not the flag, and make the second caller *wait* rather than join a thread that is already being joined. |
+| 11 | GStreamer set capture up perfectly, then failed at `STREAMON` with `EACCES` | A `dup()` was not interposed, so the copy was the bare pipe underneath. `v4l2src` allocates buffers on the original fd and streams on a duplicate, so everything up to the last step worked. Unlike a second `open()`, a `dup` shares one file description and must therefore share the capture — the opposite of the rule in #8. |
 
-The eleventh is the one worth reading twice, because no amount of care
+The twelfth is the one worth reading twice, because no amount of care
 inside the shim would have prevented it.
 
 **Chromium's camera could be acquired once and never again.** The second
@@ -1042,6 +1043,7 @@ live microphone at the same time, with no switches at all.
 | 23 | **The camera was openable but not discoverable.** `ffmpeg -i /dev/video0` worked while browsers and GStreamer still showed nothing, because they never scan `/dev`: they walk `/sys/class/video4linux`, read `name` and `dev` out of each entry, and only then open the node they were told about. Here `/sys` is traversable but not listable — the directories carry `x` without `r` — so `opendir("/sys/class/video4linux")` fails with `EACCES` while `open()` of a known path underneath succeeds. | **High** | ✅ fixed | `native/sysfs-shim.c` overlays a synthetic entry, generated at install time so it can name this device and reproduce the symlink layout a real driver produces (the class entry links into `/sys/devices`, the device links back to its subsystem; udev follows both and rejects an entry where they disagree). The overlay is **additive** — a path is redirected only where the synthetic tree has something at it — because a blanket `/sys` redirect breaks the C library itself, which reads `/sys/devices/system/cpu/online`. Verified: `ls /sys/class/video4linux` goes from `Permission denied` to `video0`, `udevadm info` goes from `Unknown device: No such device` to a full resolution (`N: video0`, `D: c 81:0`, `U: video4linux`), and `/sys/devices/system/cpu/online` still reads `0-7` through the shim. |
 | 24 | **`libv4l2` applications bypassed the shim entirely.** VLC opened `/dev/video0`, and then failed at the first `VIDIOC_QUERYCAP` with `EACCES` — the kernel's answer to an `ioctl` on the pipe backing our handle. Tracing showed the `open()` reaching the shim and **not a single `ioctl` following it**. `libv4l2` — the userspace conversion layer VLC, cheese and most GTK camera apps go through — deliberately does not call libc: its private header defines `SYS_IOCTL` and friends as direct `syscall()` invocations, because `libv4l2` also ships `v4l2convert.so`, which interposes those very symbols, so calling them would make it recurse into itself. Nothing in the shim was wrong; it simply was not being asked. | Medium | ✅ fixed | `syscall()` is itself an ordinary libc function, so the shim interposes **it** as well and routes `SYS_ioctl`/`SYS_read`/`SYS_close`/`SYS_mmap`/`SYS_munmap`/`SYS_openat` on our handles back through the same implementations. The passthrough uses inline `svc` rather than `dlsym(RTLD_NEXT, "syscall")`, because `syscall()` can be called before the constructor has run and must not depend on the dynamic linker having got there first. VLC went from a 160-byte empty file to a **10.4 MB H.264 capture, 720x1280, 3069 frames**. |
 | 25 | **Applications launched from the desktop menu got none of it.** The install hooked `~/.xprofile`, which is where a session is conventionally given its environment — and on this system **`startxfce4` never reads that file**. It execs `$XDG_CONFIG_HOME/xfce4/xinitrc` if present and `/etc/xdg/xfce4/xinitrc` otherwise, so the hook *looked* installed, reported `ok`, and did nothing. The resulting symptom is the confusing kind: the camera works in a terminal and is absent from the very same application started from the menu, which points suspicion at the application rather than at the environment it inherited. | Medium | ✅ fixed | `hw-enable` now writes the session hook where the session actually looks, generating `~/.config/xfce4/xinitrc` (or inserting a marked block into one that already exists) as well as `.xprofile`. The generated wrapper does not assume the system file carries an exec bit, because a wrapper that cannot hand over is not a missing camera but a desktop that never appears. `status` additionally reports whether the **running** session has the shims, since installing cannot retrofit a desktop that is already up. Uninstall is exact either way: a file this script generated is removed outright, one that pre-existed has only its block cut out and comes back byte for byte. |
+| 26 | **GStreamer could not capture at all.** `v4l2src` negotiated caps, allocated and mapped four buffers, and then failed with `Buffer pool activation failed` / `not-negotiated`, which points at format negotiation — the one thing that had actually succeeded. The real message was two lines deeper in `GST_DEBUG`: `error with STREAMON 13 (Permission denied)`. `gst_v4l2_buffer_pool_new()` **dups** the device fd and drives streaming through the copy, and `dup` was not interposed, so the copy was the bare pipe underneath our handle and `EACCES` was the kernel answering an ioctl on a pipe. This matters well beyond `gst-launch`: GStreamer is what Cheese, GNOME Camera and a long tail of GTK applications use. | Medium | ✅ fixed | `dup`, `dup2`, `dup3` and `fcntl`/`fcntl64` with `F_DUPFD` are now interposed, and the result is registered as a **duplicate** rather than as a secondary handle — the distinction being that a `dup` shares one file description, so it must share the capture, where a second `open()` is a different description and is still refused at `REQBUFS` (gap #17's rule). Closing either reference leaves the capture running on the other, and if the original goes first the capture is handed to a surviving duplicate, which is what a pool outliving its object does. `fcntl64` is answered as well as `fcntl` for the same reason `mmap64` is. Verified: `gst-launch-1.0 v4l2src` writes **30 of 30 unique JPEGs**, and the pre-fix shim fails the new `tests/dupfd.c` with exactly `STREAMON on the dup: Permission denied`. |
 
 ## Verification of the fixes
 
@@ -1149,7 +1151,12 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #25 session | Generated `~/.config/xfce4/xinitrc`, then `hw-enable uninstall` | file **removed outright**; `.xprofile` cleaned |
 | #25 session | A pre-existing user `xinitrc` with its own settings, through install and uninstall | block inserted above the user's lines, then removed — `diff` reports the file **identical to the original** |
 | #25 session | `hw-enable status` against a desktop started before the install | warns that menu-launched apps will not see the hardware until the session restarts, and that new terminals are fine |
-| native | `native/run-tests` (ffmpeg, concurrent handles, re-acquire, libv4l2, libudev) | **6 passed, 0 failed** |
+| native | `native/run-tests` (ffmpeg, concurrent handles, re-acquire, duplicated handles, libv4l2, libudev) | **7 passed, 0 failed** |
+| #26 gstreamer | `gst-launch-1.0 v4l2src ! jpegenc ! multifilesink`, 30 buffers | **30 of 30 frames written and all 30 distinct**, ~100–116 KB each, real luminance — not a frozen or black frame |
+| #26 dup | `tests/dupfd.c`: allocate on the original, `STREAMON`/`DQBUF` on the duplicate | 1,382,400-byte frame through the dup; capture survives closing either reference, in both orders |
+| #26 control | The same test against the **pre-fix** shim built from the previous commit | fails at exactly `STREAMON on the dup: Permission denied`, so the test measures the fix rather than the weather |
+| #26 regression | Whole container re-checked under the new `dup`/`fcntl` interposers: `ls`, pipes, `git`, `tar`, `sort`, shell fd redirection, Python `os.dup` | all unaffected |
+| #26 browser | Chromium re-run after the change: `getUserMedia({video:true,audio:true})`, snapshot, enumerate, release, re-acquire | `video=1 audio=1`, **720x1280 with 489,439/921,600 non-black pixels**, `video=1 audio=2` devices, re-acquire ok |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm

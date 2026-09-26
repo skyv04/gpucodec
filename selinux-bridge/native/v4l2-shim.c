@@ -93,6 +93,10 @@ static int (*real_open)(const char *, int, ...);
 static int (*real_open64)(const char *, int, ...);
 static int (*real_openat)(int, const char *, int, ...);
 static int (*real_close)(int);
+static int (*real_dup)(int);
+static int (*real_dup2)(int, int);
+static int (*real_dup3)(int, int, int);
+static int (*real_fcntl)(int, int, ...);
 static int (*real_ioctl)(int, unsigned long, ...);
 static ssize_t (*real_read)(int, void *, size_t);
 static void *(*real_mmap)(void *, size_t, int, int, int, off_t);
@@ -232,6 +236,10 @@ static void shim_init(void)
     real_open64  = dlsym(RTLD_NEXT, "open64");
     real_openat  = dlsym(RTLD_NEXT, "openat");
     real_close   = dlsym(RTLD_NEXT, "close");
+    real_dup     = dlsym(RTLD_NEXT, "dup");
+    real_dup2    = dlsym(RTLD_NEXT, "dup2");
+    real_dup3    = dlsym(RTLD_NEXT, "dup3");
+    real_fcntl   = dlsym(RTLD_NEXT, "fcntl");
     real_ioctl   = dlsym(RTLD_NEXT, "ioctl");
     real_read    = dlsym(RTLD_NEXT, "read");
     real_mmap    = dlsym(RTLD_NEXT, "mmap");
@@ -306,18 +314,64 @@ static int is_extra_fd(int fd)
     return 0;
 }
 
+/* Duplicates of the primary handle.
+ *
+ * A second open() is a different file description and is treated as a
+ * secondary handle above. A dup() is not: it shares one file description,
+ * so an ioctl on the copy is by definition an ioctl on the original, and
+ * the copy must see the same streaming state and the same buffers.
+ *
+ * This is not a theoretical distinction. GStreamer's v4l2src dups the
+ * device fd when it builds its buffer pool and then issues STREAMON on the
+ * copy, having done REQBUFS and QUERYBUF on the original -- so without
+ * this, capture sets itself up perfectly and then fails at the last step
+ * with EACCES, the kernel's answer to an ioctl on the pipe underneath. */
+#define MAX_ALIAS_FDS 8
+static int alias_fds[MAX_ALIAS_FDS];
+static int n_alias;
+
+static int is_alias_fd(int fd)
+{
+    for (int i = 0; i < n_alias; i++)
+        if (alias_fds[i] == fd) return 1;
+    return 0;
+}
+
+static void drop_alias(int fd)
+{
+    for (int i = 0; i < n_alias; i++) {
+        if (alias_fds[i] == fd) {
+            alias_fds[i] = alias_fds[--n_alias];
+            return;
+        }
+    }
+}
+
+static void drop_extra(int fd)
+{
+    for (int i = 0; i < n_extra; i++) {
+        if (extra_fds[i] == fd) {
+            extra_fds[i] = extra_fds[--n_extra];
+            return;
+        }
+    }
+}
+
 /* C.fd is -1 when closed, so every one of these must reject fd < 0 first:
  * a plain close(-1) would otherwise compare equal and tear down state that
- * a live capture is using. */
+ * a live capture is using.
+ *
+ * A duplicate counts as the primary handle everywhere except in close(),
+ * which is the one place the difference matters. */
 static int is_primary_fd(int fd)
 {
-    return inited && fd >= 0 && C.fd == fd;
+    return inited && fd >= 0 && (C.fd == fd || is_alias_fd(fd));
 }
 
 static int is_our_fd(int fd)
 {
     if (!inited || fd < 0) return 0;
-    return C.fd == fd || is_extra_fd(fd);
+    return C.fd == fd || is_alias_fd(fd) || is_extra_fd(fd);
 }
 
 /* ---------- geometry discovery ---------- */
@@ -809,19 +863,27 @@ int close(int fd)
         if (fd >= 0 && is_extra_fd(fd)) {
             /* A secondary handle owns no capture state, so closing it must
              * not tear down the stream the primary handle is running. */
-            for (int i = 0; i < n_extra; i++) {
-                if (extra_fds[i] == fd) {
-                    extra_fds[i] = extra_fds[--n_extra];
-                    break;
-                }
+            drop_extra(fd);
+            ours = 1;
+        } else if (fd >= 0 && is_alias_fd(fd)) {
+            /* One reference of several to the same file description. The
+             * capture belongs to the description, not to this number. */
+            drop_alias(fd);
+            ours = 1;
+        } else if (inited && fd >= 0 && C.fd == fd) {
+            ours = 1;
+            if (n_alias > 0) {
+                /* Duplicates outlive the original, exactly as they would
+                 * with a real driver, so hand the capture to one of them
+                 * rather than tearing down underneath a live reader. */
+                C.fd = alias_fds[--n_alias];
+                dbg("close(%d): capture continues on duplicate %d", fd, C.fd);
+            } else {
+                stop_stream();
+                free_buffers();
+                if (C.notify_w >= 0) { real_close(C.notify_w); C.notify_w = -1; }
+                C.fd = -1;
             }
-            ours = 1;
-        } else if (is_primary_fd(fd)) {
-            ours = 1;
-            stop_stream();
-            free_buffers();
-            if (C.notify_w >= 0) { real_close(C.notify_w); C.notify_w = -1; }
-            C.fd = -1;
         }
         UNLOCK();
         SHIM_LEAVE();
@@ -829,6 +891,112 @@ int close(int fd)
     if (ours) dbg("close(%d)", fd);
     if (!real_close) return (int)syscall(SYS_close, fd);
     return real_close(fd);
+}
+
+/* ---------- duplicating a handle ----------
+ *
+ * The kernel fd underneath ours is a real pipe, so the duplication itself
+ * always works and needs no help; what needs help is the bookkeeping, and
+ * getting that wrong is silent. An unregistered duplicate is simply a pipe,
+ * and an ioctl on a pipe is EACCES -- which reads like a permission problem
+ * with the camera rather than what it is. */
+static void note_duplicate(int oldfd, int nfd)
+{
+    if (nfd < 0 || nfd == oldfd) return;
+    /* The new number may have been one of ours a moment ago: dup2 and dup3
+     * close their target first. */
+    drop_alias(nfd);
+    drop_extra(nfd);
+    if (C.fd == nfd) C.fd = -1;
+
+    if (is_primary_fd(oldfd)) {
+        if (n_alias < MAX_ALIAS_FDS) {
+            alias_fds[n_alias++] = nfd;
+            dbg("dup: %d is now a duplicate of the capture handle", nfd);
+        } else {
+            dbg("dup: too many duplicates, %d will not be recognised", nfd);
+        }
+    } else if (is_extra_fd(oldfd)) {
+        if (n_extra < MAX_EXTRA_FDS) extra_fds[n_extra++] = nfd;
+    }
+}
+
+static int dup_common(int oldfd, int nfd)
+{
+    if (nfd < 0 || !inited || SHIM_BUSY()) return nfd;
+    SHIM_ENTER();
+    LOCK();
+    note_duplicate(oldfd, nfd);
+    UNLOCK();
+    SHIM_LEAVE();
+    return nfd;
+}
+
+int dup(int oldfd)
+{
+    int nfd = real_dup ? real_dup(oldfd) : (int)syscall(SYS_dup, oldfd);
+    return dup_common(oldfd, nfd);
+}
+
+int dup2(int oldfd, int newfd)
+{
+    int nfd;
+    if (real_dup2) nfd = real_dup2(oldfd, newfd);
+    else if (real_dup3) nfd = real_dup3(oldfd, newfd, 0);
+    else nfd = (int)syscall(SYS_dup3, oldfd, newfd, 0);
+    return dup_common(oldfd, nfd);
+}
+
+int dup3(int oldfd, int newfd, int flags)
+{
+    int nfd = real_dup3 ? real_dup3(oldfd, newfd, flags)
+                        : (int)syscall(SYS_dup3, oldfd, newfd, flags);
+    return dup_common(oldfd, nfd);
+}
+
+/* fcntl is a third way to duplicate a descriptor, and libraries that want a
+ * particular fd number reach for it. Everything else it does is none of our
+ * business, so it is passed straight through.
+ *
+ * fcntl64 is a distinct exported symbol at the same address, and a caller
+ * built with _FILE_OFFSET_BITS=64 -- which is most of them -- lands on it
+ * rather than on fcntl, so both names have to be answered. */
+static int fcntl_common(int fd, int cmd, void *arg)
+{
+    int r;
+
+    /* Before the constructor has run the dynamic linker may not be able to
+     * resolve anything yet, and asking it to would allocate; go straight to
+     * the kernel instead. */
+    if (!inited) return (int)syscall(SYS_fcntl, fd, cmd, arg);
+
+    if (!real_fcntl) real_fcntl = dlsym(RTLD_NEXT, "fcntl");
+    r = real_fcntl ? real_fcntl(fd, cmd, arg)
+                   : (int)syscall(SYS_fcntl, fd, cmd, arg);
+
+    if (r >= 0 && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC))
+        return dup_common(fd, r);
+    return r;
+}
+
+int fcntl(int fd, int cmd, ...)
+{
+    va_list ap;
+    void *arg;
+    va_start(ap, cmd);
+    arg = va_arg(ap, void *);
+    va_end(ap);
+    return fcntl_common(fd, cmd, arg);
+}
+
+int fcntl64(int fd, int cmd, ...)
+{
+    va_list ap;
+    void *arg;
+    va_start(ap, cmd);
+    arg = va_arg(ap, void *);
+    va_end(ap);
+    return fcntl_common(fd, cmd, arg);
 }
 
 /* Caller has already established that fd is our primary handle and has
@@ -1580,6 +1748,16 @@ long syscall(long number, ...)
             break;
         case SYS_openat:
             if (is_our_path((const char *)b)) return openat((int)a, (const char *)b, (int)c, (mode_t)d);
+            break;
+        case SYS_dup:
+            if (is_our_fd((int)a)) return dup((int)a);
+            break;
+        case SYS_dup3:
+            if (is_our_fd((int)a)) return dup3((int)a, (int)b, (int)c);
+            break;
+        case SYS_fcntl:
+            if (is_our_fd((int)a) && ((int)b == F_DUPFD || (int)b == F_DUPFD_CLOEXEC))
+                return fcntl((int)a, (int)b, (void *)c);
             break;
         default:
             break;
