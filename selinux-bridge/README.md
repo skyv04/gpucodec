@@ -143,7 +143,24 @@ After that, in any new shell:
 | The GPU | anything OpenGL; Chromium and Electron apps just start | Turnip + Zink; `pci-shim` for browsers |
 | Hardware codecs | `ffmpeg -c:v h264_selinuxbridge …` | `ffmpeg` on `PATH` |
 
-`hw-enable uninstall` puts the machine back exactly as it was. Every shim
+Applications started from the XFCE menu or a panel need the same treatment
+as ones started from a terminal, and that turns out to be a trap worth
+writing down. **`startxfce4` never reads `~/.xprofile` on this system.** It
+execs `$XDG_CONFIG_HOME/xfce4/xinitrc` if that exists and
+`/etc/xdg/xfce4/xinitrc` otherwise — so a `.xprofile` hook *looks* installed
+and silently does nothing, and the failure it produces is the confusing kind:
+the camera works in a terminal and is missing from the same application
+launched from the menu. `hw-enable install` therefore writes both, generating
+`~/.config/xfce4/xinitrc` (or inserting a marked block into an existing one)
+so the whole session inherits the environment. Because a session that cannot
+start is a far worse outcome than one without a camera, that wrapper does not
+assume the system file is executable, and `hw-enable status` reports whether
+the *currently running* session has the shims — a fresh install does not
+reach a desktop that was already up, which needs a session restart.
+
+`hw-enable uninstall` puts the machine back exactly as it was: a generated
+`xinitrc` is removed outright, while one that already existed has only its
+marked block cut out and is restored byte for byte. Every shim
 can also be switched off on its own without rebuilding, which is the first
 thing to try if some application misbehaves:
 `BRIDGE_V4L2_DISABLE=1`, `BRIDGE_PCI_DISABLE=1`, `BRIDGE_NETLINK_DISABLE=1`,
@@ -1024,6 +1041,7 @@ live microphone at the same time, with no switches at all.
 | 22 | **Device enumeration returned nothing, so browsers reported no camera *and* no microphone.** With `/dev/video0` working and PulseAudio serving audio, Chromium still listed **0 video and 0 audio** devices. `libudev` opens a `NETLINK_KOBJECT_UEVENT` socket during initialisation; that socket is denied here, `udev_monitor_new_from_netlink()` fails, and libudev then reports an empty device list rather than an error. One denied socket therefore zeroed out both device classes — and the microphone had nothing to do with netlink, which is what made this so misleading to chase. | **High** | ✅ fixed | `native/netlink-shim.c` hands out a working substitute socket so libudev initialises. Chromium then reports `1v/2a` and both `getUserMedia({audio:true})` and `{video:true}` succeed. |
 | 23 | **The camera was openable but not discoverable.** `ffmpeg -i /dev/video0` worked while browsers and GStreamer still showed nothing, because they never scan `/dev`: they walk `/sys/class/video4linux`, read `name` and `dev` out of each entry, and only then open the node they were told about. Here `/sys` is traversable but not listable — the directories carry `x` without `r` — so `opendir("/sys/class/video4linux")` fails with `EACCES` while `open()` of a known path underneath succeeds. | **High** | ✅ fixed | `native/sysfs-shim.c` overlays a synthetic entry, generated at install time so it can name this device and reproduce the symlink layout a real driver produces (the class entry links into `/sys/devices`, the device links back to its subsystem; udev follows both and rejects an entry where they disagree). The overlay is **additive** — a path is redirected only where the synthetic tree has something at it — because a blanket `/sys` redirect breaks the C library itself, which reads `/sys/devices/system/cpu/online`. Verified: `ls /sys/class/video4linux` goes from `Permission denied` to `video0`, `udevadm info` goes from `Unknown device: No such device` to a full resolution (`N: video0`, `D: c 81:0`, `U: video4linux`), and `/sys/devices/system/cpu/online` still reads `0-7` through the shim. |
 | 24 | **`libv4l2` applications bypassed the shim entirely.** VLC opened `/dev/video0`, and then failed at the first `VIDIOC_QUERYCAP` with `EACCES` — the kernel's answer to an `ioctl` on the pipe backing our handle. Tracing showed the `open()` reaching the shim and **not a single `ioctl` following it**. `libv4l2` — the userspace conversion layer VLC, cheese and most GTK camera apps go through — deliberately does not call libc: its private header defines `SYS_IOCTL` and friends as direct `syscall()` invocations, because `libv4l2` also ships `v4l2convert.so`, which interposes those very symbols, so calling them would make it recurse into itself. Nothing in the shim was wrong; it simply was not being asked. | Medium | ✅ fixed | `syscall()` is itself an ordinary libc function, so the shim interposes **it** as well and routes `SYS_ioctl`/`SYS_read`/`SYS_close`/`SYS_mmap`/`SYS_munmap`/`SYS_openat` on our handles back through the same implementations. The passthrough uses inline `svc` rather than `dlsym(RTLD_NEXT, "syscall")`, because `syscall()` can be called before the constructor has run and must not depend on the dynamic linker having got there first. VLC went from a 160-byte empty file to a **10.4 MB H.264 capture, 720x1280, 3069 frames**. |
+| 25 | **Applications launched from the desktop menu got none of it.** The install hooked `~/.xprofile`, which is where a session is conventionally given its environment — and on this system **`startxfce4` never reads that file**. It execs `$XDG_CONFIG_HOME/xfce4/xinitrc` if present and `/etc/xdg/xfce4/xinitrc` otherwise, so the hook *looked* installed, reported `ok`, and did nothing. The resulting symptom is the confusing kind: the camera works in a terminal and is absent from the very same application started from the menu, which points suspicion at the application rather than at the environment it inherited. | Medium | ✅ fixed | `hw-enable` now writes the session hook where the session actually looks, generating `~/.config/xfce4/xinitrc` (or inserting a marked block into one that already exists) as well as `.xprofile`. The generated wrapper does not assume the system file carries an exec bit, because a wrapper that cannot hand over is not a missing camera but a desktop that never appears. `status` additionally reports whether the **running** session has the shims, since installing cannot retrofit a desktop that is already up. Uninstall is exact either way: a file this script generated is removed outright, one that pre-existed has only its block cut out and comes back byte for byte. |
 
 ## Verification of the fixes
 
@@ -1128,6 +1146,10 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #17 browser | Microphone cross-check: browser analyser vs `parec` on the same source | agree — `parec` reads rms **41**, peak **233**, 99.0% non-zero over 7.94 s; the browser's lower numbers are the same signal scaled into the 0–255 byte domain |
 | native | `hw-enable doctor` after `hw-enable install` | **all native hardware paths are working** — bridge reachable, 10 frames captured, libudev resolves the camera, real sysfs intact, 524,792 B of live audio in 3 s, Adreno GPU, Chromium renders, `h264_selinuxbridge` present |
 | native | A **fresh login shell**, nothing typed | all four shims on `LD_PRELOAD`; `ffmpeg` captures 60 frames, `ls /sys/class/video4linux` lists `video0`, `udevadm` resolves it, default PulseAudio source is `phone_mic` |
+| #25 session | Generated `~/.config/xfce4/xinitrc`, then `hw-enable uninstall` | file **removed outright**; `.xprofile` cleaned |
+| #25 session | A pre-existing user `xinitrc` with its own settings, through install and uninstall | block inserted above the user's lines, then removed — `diff` reports the file **identical to the original** |
+| #25 session | `hw-enable status` against a desktop started before the install | warns that menu-launched apps will not see the hardware until the session restarts, and that new terminals are fine |
+| native | `native/run-tests` (ffmpeg, concurrent handles, re-acquire, libv4l2, libudev) | **6 passed, 0 failed** |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm
