@@ -48,6 +48,7 @@ FIFO="$STATE_DIR/mic.fifo"
 
 PIDFILE="$STATE_DIR/mic.pid"
 MODFILE="$STATE_DIR/mic.module"
+REMAPFILE="$STATE_DIR/mic.remap"
 LOGFILE="$STATE_DIR/mic.log"
 
 SOURCE=mic
@@ -56,7 +57,17 @@ CHANNELS=1
 # The sink is what we create; the monitor of it is what applications record
 # from. Naming the sink bridge_mic keeps the recording device bridge_mic.monitor.
 SINK_NAME=bridge_mic
-SOURCE_NAME="$SINK_NAME.monitor"
+MONITOR_NAME="$SINK_NAME.monitor"
+
+# The monitor of the null sink carries the audio perfectly well, but a great
+# many applications refuse to show monitor sources at all -- Chromium and
+# everything built on it, Zoom, Discord, OBS -- because a monitor is normally
+# loopback of the speakers, and offering it as a microphone causes feedback.
+# The result is a microphone that works everywhere except in the programs
+# people actually make calls with. module-remap-source republishes the same
+# stream as an ordinary input device, which those filters accept.
+REMAP_NAME=phone_mic
+SOURCE_NAME="$REMAP_NAME"
 # Small enough not to be felt in a call, large enough to absorb the bursts
 # the phone link delivers in.
 LATENCY_MS="${BRIDGE_MIC_LATENCY_MS:-50}"
@@ -102,14 +113,23 @@ fully_running() {
 }
 
 unload_module() {
+    # Unload the remap before the sink it is derived from, or PulseAudio is
+    # briefly left with a source whose master has gone.
+    if [ -f "$REMAPFILE" ]; then
+        pactl unload-module "$(cat "$REMAPFILE")" 2>/dev/null
+        rm -f "$REMAPFILE"
+    fi
     if [ -f "$MODFILE" ]; then
         pactl unload-module "$(cat "$MODFILE")" 2>/dev/null
         rm -f "$MODFILE"
     fi
-    # Belt and braces: an earlier run that was killed hard leaves the module
+    # Belt and braces: an earlier run that was killed hard leaves the modules
     # loaded with no state file, and loading a second one would give two
-    # sinks with the same name.
+    # devices with the same name.
     local idx
+    idx=$(pactl list short modules 2>/dev/null \
+          | awk -v n="source_name=$REMAP_NAME" '$2=="module-remap-source" && $0 ~ n {print $1}')
+    for i in $idx; do pactl unload-module "$i" 2>/dev/null; done
     idx=$(pactl list short modules 2>/dev/null \
           | awk -v n="sink_name=$SINK_NAME" '$2=="module-null-sink" && $0 ~ n {print $1}')
     for i in $idx; do pactl unload-module "$i" 2>/dev/null; done
@@ -133,7 +153,7 @@ stop)
 status)
     if fully_running; then
         echo "running (pids $(tr '\n' ' ' <"$PIDFILE"))"
-        pactl list short sources 2>/dev/null | grep -F "$SINK_NAME" || true
+        pactl list short sources 2>/dev/null | grep -E "$SINK_NAME|$REMAP_NAME" || true
         exit 0
     fi
     if running; then
@@ -187,6 +207,19 @@ if ! [[ "$MODID" =~ ^[0-9]+$ ]]; then
 fi
 echo "$MODID" > "$MODFILE"
 
+REMAPID=$(pactl load-module module-remap-source \
+              source_name="$REMAP_NAME" master="$MONITOR_NAME" \
+              source_properties=device.description=Phone_Microphone 2>&1)
+if [[ "$REMAPID" =~ ^[0-9]+$ ]]; then
+    echo "$REMAPID" > "$REMAPFILE"
+else
+    # Not fatal: the monitor still carries the audio, so anything that does
+    # not filter monitors out keeps working.
+    echo "warning: could not publish $REMAP_NAME ($REMAPID);" \
+         "falling back to $MONITOR_NAME" >&2
+    SOURCE_NAME="$MONITOR_NAME"
+fi
+
 mkfifo "$FIFO" || { echo "cannot create $FIFO" >&2; unload_module; exit 1; }
 
 # pacat first: opening a FIFO for reading blocks until a writer appears, and
@@ -224,6 +257,7 @@ cat <<EOF
 microphone bridge running
   source:  $SOURCE ($RATE Hz, $CHANNELS ch, s16le)
   pulse:   $SOURCE_NAME (now the default source)
+  monitor: $MONITOR_NAME (same audio, hidden from some apps)
   latency: ${LATENCY_MS} ms
   fifo:    $FIFO (container-local)
 

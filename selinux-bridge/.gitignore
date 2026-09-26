@@ -2,3 +2,6 @@ build/
 *.apk
 *.keystore
 bridge_client
+
+# built by native/Makefile; rebuilt with `make` or `hw-enable install`
+native/*.so

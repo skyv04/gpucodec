@@ -58,9 +58,16 @@ to remind you.
 | `tools/bridge-status` | Health-check script: reports whether the app is reachable and prints its `info` diagnostics (device, Android version, all four video codecs and which are hardware-backed, concurrency limit). `--log` also dumps the app's log. |
 | `tools/hw-transcode` | Wrapper that pipes an arbitrary ffmpeg-readable input through the bridge's hardware encoder and remuxes to a normal container — the hardware-codec analogue of this repo's `agc-from`/`agc-to`. `-c hevc` selects HEVC; `-D` also decodes on the hardware block, making the transcode hardware end to end. |
 | `tools/selftest` | Full regression suite. Needs no phone and no installed APK: it runs everything against the mock bridge, including fault injection that cannot be arranged reliably on real hardware. |
-| `tools/bridge-webcam` | Publishes the phone camera as a **FIFO** carrying Y4M, which native applications (`ffplay`, `ffmpeg`, VLC, OBS…) read like any other source. A FIFO makes the camera on-demand for free: opening one for write blocks until a reader attaches, so the camera is not opened — and its indicator not lit — until something actually wants frames, and it is released the moment the reader goes away. |
-| `tools/bridge-mic` | Publishes the phone microphone as a **real PulseAudio device** (`bridge_mic`, recorded from as `bridge_mic.monitor`) using a null sink fed by `pacat`, and makes it the default. No kernel module and no root: PulseAudio is a userspace daemon, so a virtual microphone is something an unprivileged user can simply create. Every audio application, browsers included, then finds it the ordinary way. It deliberately does **not** use `module-pipe-source`, which has no flow control and inflates the audio by 20–45%; see "Why a null sink" for the measurements. |
-| `tools/bridge-browser` | Launches Chromium wired to the bridged microphone, and optionally (`--clip SECONDS`) to a short recording from the bridged camera. It does **not** offer a live browser camera, because Chromium cannot accept one — see gap #17. |
+| `native/v4l2-shim.c` | Puts the phone camera on **`/dev/video0`** as a real V4L2 capture node, by interposing the dozen libc calls a V4L2 client actually makes. No kernel module, no `v4l2loopback`, no root: an application never talks to a driver, it talks to libc. Stock `ffmpeg`, VLC, Chromium and anything else that opens the node work unmodified and with no flags. |
+| `native/pci-shim.c` | Answers the one unreadable `/proc/bus/pci/devices` that `libpci` insists on, without which **every** Chromium- or Electron-based application aborts during start-up. |
+| `native/netlink-shim.c` | Hands out a working substitute for the `NETLINK_KOBJECT_UEVENT` socket this container may not open. `libudev` gives up when that socket fails and reports an empty device list, which is why Chromium saw no camera *and* no microphone. |
+| `native/sysfs-shim.c` | Overlays a readable `/sys/class/video4linux` entry for the camera. Enumeration reads sysfs, never `/dev`, so without this the device list is empty however well `/dev/video0` behaves. The overlay is additive — a path is redirected only where the synthetic tree has an entry — because glibc itself reads `/sys/devices/system/cpu/online`. |
+| `native/hw-enable` | One entry point that installs, removes, reports and **proves** all of the above: `install`, `uninstall`, `status`, `doctor`. `doctor` captures real frames, resolves the camera through `libudev`, records real audio, starts a real Chromium and checks the codecs, rather than reporting that files exist. |
+| `native/run-tests` + `native/tests/` | Fast regression suite for the shim. Every bug that mattered was only reproducible through a browser, and a Chromium run costs two to four minutes here and can be killed by memory pressure half way through; these reproduce the same failures in seconds. Covers stock `ffmpeg`, concurrent handles, acquire/release/re-acquire with a blocked `DQBUF` racing teardown, the `libv4l2` raw-syscall path via VLC, and `libudev` enumeration. |
+| `native/hw-session` | Keeps the microphone published for the life of the desktop session, restarting the pipeline with backoff when the phone link drops and reaping clients left over from earlier runs. |
+| `tools/bridge-webcam` | The earlier, LD_PRELOAD-free route: publishes the phone camera as a **FIFO** carrying Y4M, which native applications (`ffplay`, `ffmpeg`, VLC, OBS…) read like any other source. Superseded by `native/v4l2-shim.c` for general use, and kept because a pipe is still the simplest thing to hand to a one-off `ffmpeg`. A FIFO makes the camera on-demand for free: opening one for write blocks until a reader attaches, so the camera is not opened — and its indicator not lit — until something actually wants frames, and it is released the moment the reader goes away. |
+| `tools/bridge-mic` | Publishes the phone microphone as a **real PulseAudio device** (`phone_mic`, backed by a null sink whose monitor is republished through `module-remap-source` — a great many applications, Chromium and everything built on it included, refuse to list monitor sources at all, so the remap is what makes the microphone visible where calls are actually made) using a null sink fed by `pacat`, and makes it the default. No kernel module and no root: PulseAudio is a userspace daemon, so a virtual microphone is something an unprivileged user can simply create. Every audio application, browsers included, then finds it the ordinary way. It deliberately does **not** use `module-pipe-source`, which has no flow control and inflates the audio by 20–45%; see "Why a null sink" for the measurements. |
+| `tools/bridge-browser` | Predates the shims: launches Chromium wired to the bridged microphone and, optionally, a short recording from the bridged camera. Superseded by `native/hw-enable install`, after which an ordinary Chromium gets the live camera *and* the live microphone together — see gap #17. |
 | `tools/bridge-demo` + `bridge-demo.html` | An interactive page for seeing the browser situation first-hand rather than taking it on faith. It starts the camera into a growing file, then serves a page showing the browser's picture next to a signature of its pixels, the live frame count of the file on disk, a microphone meter and a ticking clock. Every frame carries the time it was captured, burned in, so the delay is readable against the page's own clock. **Record 10 s** captures a clip through `MediaRecorder` for offline analysis. |
 | `tools/mock-bridge.py` | A protocol-v6 bridge that reproduces the awkward parts of MediaCodec — codec-config packets, one packet per access unit, lookahead that swallows frames before emitting anything, decode format records — backed by a real x264/x265 subprocess so the output is a genuine stream. It also fakes capture, including the HAL's habit of rounding a requested camera size to one it actually offers, and can be told to refuse a permission (`MOCK_DENY_CAMERA`, `MOCK_DENY_MIC`). `MOCK_RESIZE_AT=N` forces a mid-stream resolution change, which is impractical to provoke on real hardware. |
 | `tools/test-i420` | JVM unit tests for `I420.java` across planar, semi-planar, padded-stride, padded-slice-height, odd-dimension and cropped layouts. |
@@ -115,6 +122,33 @@ otherwise) after confirming the new one works.
 Launch the app once and leave it open (or in the recent-apps list — it runs
 as a foreground service with a persistent notification, so Android won't
 kill it). It listens on `127.0.0.1:7878` for as long as it's alive.
+
+### Making the hardware native to the whole container
+
+With the app running, one command wires the phone's hardware into the
+standard Linux interfaces, so that applications already installed — and any
+installed later — find it without knowing this project exists:
+
+```sh
+selinux-bridge/native/hw-enable install   # camera, mic, GPU, codecs
+selinux-bridge/native/hw-enable doctor    # prove each path end to end
+```
+
+After that, in any new shell:
+
+| You want | You run | What it uses |
+|---|---|---|
+| The camera | `ffmpeg -f v4l2 -i /dev/video0 …`, `vlc v4l2:///dev/video0`, `getUserMedia` in a browser | `/dev/video0` |
+| The microphone | anything that records | the default PulseAudio source, `phone_mic` |
+| The GPU | anything OpenGL; Chromium and Electron apps just start | Turnip + Zink; `pci-shim` for browsers |
+| Hardware codecs | `ffmpeg -c:v h264_selinuxbridge …` | `ffmpeg` on `PATH` |
+
+`hw-enable uninstall` puts the machine back exactly as it was. Every shim
+can also be switched off on its own without rebuilding, which is the first
+thing to try if some application misbehaves:
+`BRIDGE_V4L2_DISABLE=1`, `BRIDGE_PCI_DISABLE=1`, `BRIDGE_NETLINK_DISABLE=1`,
+`BRIDGE_SYSFS_DISABLE=1`. `BRIDGE_V4L2_DEBUG=1` (or `2`) traces the camera
+path.
 
 The landing screen is a dark, gradient-themed dashboard rather than a blank
 white page: a chip-logo header, a pulsing green "listening" status card, a
@@ -442,12 +476,23 @@ Or straight from the client, without the supervisor:
 ./bridge_client mic 48000 1 0 - > mic.s16     # raw S16LE
 ```
 
-The microphone becomes a real PulseAudio device called `bridge_mic`, whose
-monitor `bridge_mic.monitor` is what applications record from, and
-`bridge-mic` makes it the default — which matters more than it sounds,
-because `getUserMedia({audio:true})` takes the *default* source, and the
-default here is otherwise a silent monitor. A working virtual microphone
-that nothing is routed to is indistinguishable from a broken one.
+The microphone becomes a real PulseAudio device. Internally it is a null
+sink called `bridge_mic`, but what applications record from is
+**`phone_mic`**, its monitor republished through `module-remap-source`, and
+`bridge-mic` makes that the default source.
+
+Both of those details were learned the hard way. The default matters because
+`getUserMedia({audio:true})` takes the *default* source, and the default here
+is otherwise a silent monitor — a working virtual microphone that nothing is
+routed to is indistinguishable from a broken one. The remap matters because a
+great many applications refuse to list monitor sources at all: Chromium and
+everything built on it, Zoom, Discord, OBS. A monitor is normally loopback of
+the speakers, and offering it as a microphone causes feedback, so hiding it is
+correct behaviour — it just meant the microphone worked everywhere except in
+the programs people actually make calls with. `module-remap-source`
+republishes the identical stream as an ordinary input device, which those
+filters accept. If the remap ever fails, `bridge-mic` falls back to
+`bridge_mic.monitor` and says so.
 
 For a call, consider `bridge-mic -s voice`, which selects
 `VOICE_COMMUNICATION` and so gets the platform echo canceller and noise
@@ -491,28 +536,78 @@ whitespace, so a quoted value with a space fails the same opaque way.
 
 ### Browsers
 
-Audio works — start `bridge-mic` and any web app gets live phone audio.
-Injected video works too, and `tools/bridge-demo` keeps it within **0.13 s**
-of the present by truncating the feed just before the camera is opened.
-What you cannot have is *both at once*: the Chromium switch that registers
-the file camera also replaces the microphone with a synthetic tone. See
-gap #17 for the measurements.
+Run `native/hw-enable install` once and an ordinary browser has the phone's
+camera and microphone together, with no switches, no wrapper and no
+launcher. `getUserMedia({video: true, audio: true})` returns
+`Phone Camera (SELinux Bridge)` and `phone_mic`, both live, and the camera
+can be released and re-acquired as many times as a call needs.
 
-If you would rather see that limit than read about it, `tools/bridge-demo`
-opens a page that demonstrates it live:
+This used to be the project's flagship limitation (gap #17), and it is worth
+saying plainly why it stood for so long: the reasoning was sound but the
+premise was wrong. The premise was that a browser could only be given a
+*fake* camera, because a real one needs a device node, which needs
+`v4l2loopback`, which needs `CAP_SYS_MODULE`. Every conclusion after that
+followed correctly and every one of them was useless, because an application
+never talks to a kernel module. It talks to libc. Once the device is
+answered for at that level, the browser has nothing to work around.
 
-```sh
-tools/bridge-demo                     # auto-selects the front camera
-tools/bridge-demo -i 0 -s 1280x720    # or pick one from 'bridge_client info'
-```
+`tools/bridge-demo` and `tools/bridge-browser` predate all this and still
+work; they are no longer the recommended route.
 
-Press **Start camera** and the picture freezes on the moment it opened,
-while right beside it the feed file's frame count climbs and the clock
-ticks — so nothing is stalled except Chromium's read. Move in front of the
-phone, press **Re-open camera**, and the picture jumps to the present and
-freezes again. **Start microphone** shows the contrast: that meter really
-is live. The feed file grows at about 7 MB/s at 640x480@15 and is deleted
-when the demo exits.
+### Interposing libc: what actually goes wrong
+
+The idea — answer the calls a V4L2 client makes — is a paragraph. Making it
+survive contact with real applications took ten distinct bugs, and they are
+recorded here because every one of them presented as something other than
+what it was.
+
+| # | Symptom | Cause |
+|---|---------|-------|
+| 1 | Segfault before `main()` | `dlsym` calls `malloc`, `malloc` calls `mmap`, and `mmap` is interposed — so it ran with `real_mmap` still NULL. Every entry point needs a raw-`syscall()` fallback and an `inited` flag. |
+| 2 | Camera helper never started, no error anywhere | Between `fork()` and `exec()` only async-signal-safe calls are legal, and `execl` allocates. `posix_spawn` instead. |
+| 3 | `EACCES` opening a device that was clearly there | Anything built with `_FILE_OFFSET_BITS=64` — which is most things, ffmpeg included — calls `mmap64`/`stat64`, not the short names. Interposing only the short ones leaves those callers on the real syscall, and a permissions error is what that looks like. |
+| 4 | Full-rate capture that still produced a 3-frame file | `VIDIOC_DQBUF` returned buffers with no `timestamp`, so ffmpeg deduplicated them. |
+| 5 | Chromium opened the device, asked one question, gave up | V4L2 request codes have the top bit set (`VIDIOC_QUERYCAP` is `0x80685600`). A caller holding one in a signed `int` — Chromium does — passes `0xFFFFFFFF80685600`. `_IOC_NR()` masks the rest away, so it *decodes* correctly while matching no `case` label. Truncating to 32 bits is not a workaround; it is what the kernel does. |
+| 6 | `posix_spawn` reported "Exec format error" for a valid ELF | `getenv()` returns a pointer *into* the environment block, and Chromium rewrites that block in place after the constructor runs. The saved path had become `""`. Copy the string; also compile the default in. |
+| 7 | Microphone worked everywhere except in the apps people call with | Chromium, Zoom, Discord and OBS all hide monitor sources, since a monitor is normally speaker loopback. `module-remap-source` republishes the same stream as an ordinary input. |
+| 8 | Chromium reported `NotFoundError` and dropped the camera | Returning `EBUSY` to a *second* `open()` looks honest and is wrong: the kernel allows many opens and makes only streaming exclusive, and Chromium probes capabilities while other tabs capture. |
+| 9 | A live capture was torn down by an unrelated `close(-1)` | Dropping an `fd >= 0` guard makes `close(-1)` compare equal to `C.fd == -1`. |
+| 10 | Heap corruption, then total silence | `stop_stream()` was gated on `C.streaming` alone, so a second caller returned early while the pump thread was still alive — and the next line freed the buffers it was still `memcpy()`ing into. Gate on the pump, not the flag, and make the second caller *wait* rather than join a thread that is already being joined. |
+
+The eleventh is the one worth reading twice, because no amount of care
+inside the shim would have prevented it.
+
+**Chromium's camera could be acquired once and never again.** The second
+`getUserMedia({video:true})` in a page hung forever. Tracing showed the shim
+going completely silent inside `VIDIOC_REQBUFS`, with the mutex recorded as
+*free*. Chromium's own `--vmodule` logs showed `GetDeviceInfosAsync` never
+returning and `VideoCaptureThr` parked in a futex. Rebuilding the previous
+version of the shim as a control cleared the obvious suspects; running
+Chromium's built-in fake device proved the fault was ours.
+
+It was `free()`. Chromium replaces the global allocator with PartitionAlloc,
+and PartitionAlloc returns memory through the **public** `munmap` — which is
+us. So `free()`, called from `REQBUFS` while we held our own lock, re-entered
+our own `munmap` wrapper, which tried to take that lock again, and a
+non-recursive mutex did exactly what it should. glibc's malloc calls a hidden
+`__munmap` alias that cannot be interposed, which is precisely why `ffmpeg`
+never showed this and Chromium always did.
+
+The fix is not a special case for `munmap`. It is the rule that removes the
+whole class: **while a thread is already inside the shim, it is not an
+application making a call, so every entry point behaves as a plain
+passthrough.** One thread-local depth counter, checked at each entry point.
+
+Two general lessons, both of which cost real time here:
+
+- *An interposing library cannot assume the code beneath it stays out of the
+  symbols it interposes.* Allocators, the dynamic linker and the C library
+  all call the things you replaced.
+- *Make the harness distinguish "failed" from "hung" before debugging
+  anything asynchronous.* The browser tests only became useful once the page
+  reported each step to a local HTTP server as it happened; `--dump-dom` and
+  `--virtual-time-budget` both race `getUserMedia` and report a plausible
+  lie.
 
 ## Testing without a device
 
@@ -888,12 +983,20 @@ and every signal available at the time — frame counts, bitrate, file size,
 decodability, luma PSNR — said the bridge was working perfectly.
 
 Status column: **fixed** entries have been implemented and verified (see
-"Verification of the fixes" below). Two gaps remain open, and neither is
-open for want of effort: #4's recoverable halves now heal themselves but its
+"Verification of the fixes" below). One gap remains open, and it is not open
+for want of effort: #4's recoverable halves now heal themselves, but its
 residue is a deliberate Android platform behaviour that no unprivileged app
-can change, and #17 is now down to a single irreducible Chromium behaviour —
-one command-line switch governs the fake camera and the fake microphone
-together, so a tab can be given one or the other but not both.
+can change.
+
+Gap #17 was the interesting one. It stood as "partly fixed — irreducible
+Chromium behaviour" for a long time, and that verdict was wrong. It was
+reasoned from the wrong premise: that the only way to give a browser a
+camera was Chromium's fake-device switch, because a real `/dev/video0`
+needed a kernel module we could not load. What that premise misses is that
+an application never talks to a kernel module — it talks to libc. Gaps
+#20–#24 are what fell out of taking that seriously, and between them they
+close #17 completely: an ordinary Chromium now gets the live camera and the
+live microphone at the same time, with no switches at all.
 
 | # | Gap | Severity | Status | Fix that shipped |
 |---|---|---|---|---|
@@ -913,9 +1016,14 @@ together, so a tab can be given one or the other but not both.
 | 14 | **Rate control was inaccurate.** `KEY_BITRATE_MODE` was never set, so Codec2 picked its own default -- VBR on this device's `c2.qti.*.encoder` components, where the requested bitrate is only an average the encoder may exceed freely. An explicit `-b:v` came back **+25% at 2 Mbps, +31% at 6 Mbps and +34% at 12 Mbps**, measured on ordinary content rather than a synthetic worst case. (Distinct from gap #11: that was zero timestamps making the encoder think the clip was instantaneous, which *under*-shot; this is the mode itself.) | Medium | ✅ fixed | Protocol v5 carries a rate-control mode in the **high byte of the codec field**, so the 24-byte header is unchanged and a v3/v4 client -- which sends a bare 0..3 -- lands on the new CBR default automatically. `bridge_client -r cbr\|vbr\|cq`, `hw-transcode -r`, and `ffmpeg -rc_mode cbr\|vbr\|cq`. CQ reinterprets the bitrate field as a quality in 1..100. An unsupported mode falls back to plain `KEY_BIT_RATE` rather than failing the session, and `info` now lists which modes each encoder advertises. |
 | 15 | **A stale process was invisible.** Android normally kills an app's process when its package is replaced, so the next start runs the new code. A long-lived foreground service makes surviving that much more likely, and nothing then reloads it: `BootReceiver`'s `MY_PACKAGE_REPLACED` handler calls `startForegroundService()`, but that only delivers another `onStartCommand()` to the **already loaded** classes. The bridge kept serving the old protocol while the user was looking at a successful install, with no symptom at all beyond a version number that never changed. Hit for real on the v4 → v5 update. | Medium | ✅ fixed | `info` now reports the **build timestamp of the code actually answering**, and the service compares the package's `lastUpdateTime` against the value this process saw at startup. `lastUpdateTime` moves only on replacement, so a difference means the package changed *while this process was already running* — exactly the stale case, with no timing heuristic to get wrong. The app footer always shows `protocol vN · build <timestamp>`, in the same format `info` uses, so the running version can be read off the screen and compared directly. When a mismatch is detected the warning appears in `info`, in `bridge.log`, and as a banner at the top of the app carrying a **Restart now** button, which ends the process so `START_STICKY` restarts the service on the new code — refusing while any transcode is in flight. |
 | 16 | **Constant quality silently degraded to VBR.** Qualcomm splits rate control across *components*: `c2.qti.hevc.encoder` does CBR and VBR, while constant quality lives on a **separate** `c2.qti.hevc.encoder.cq`. Picking the first `c2.qti.*` match therefore handed every CQ request to a component that cannot do CQ, which then fell back to its default — VBR — and encoded anyway. `-c h264 -r cq` produced a file **byte-for-byte the same size** as `-r vbr` (7,679,474 B), i.e. the mode was doing nothing at all. Found by this round of hardware testing, in a feature added one commit earlier. | High | ✅ fixed | Component selection is now rate-control aware and prefers one that supports the requested mode, so CQ lands on `*.encoder.cq`. If no component supports it the encode is **refused**, naming what is supported (`rate control 'cq' is not supported by c2.qti.avc.encoder (supported: cbr,vbr)`), because silently substituting rate control is precisely what hid #14. |
-| 17 | **A browser cannot be given a live camera *and* live audio at the same time.** Chromium's only route for an injected camera is `--use-file-for-fake-video-capture`, and that file device is only registered when `--use-fake-device-for-media-stream` is also present — verified here by removing it, after which `getUserMedia({video:true})` fails outright (`videoOpened False`, `0x0`). But that same switch also replaces the **microphone** with a synthetic tone: a clip recorded through the demo came back with audio clipping at full scale and a dead-constant RMS of 14448, nothing like the room. So a tab can have the phone's camera or the phone's microphone, never both. A second, softer limit applies to the video itself: `FileVideoCaptureDevice` plays the file **from its first byte and never seeks**, so the picture starts as far behind the present as the file was long when the camera opened, and that offset never closes — which is what made this look like a frozen image in earlier testing. It is not frozen: a headless self-check counted **50 distinct frames and 0 repeats** in 25 s. | Medium | ⚠️ partly fixed | The lag half is solved: `tools/bridge-demo` truncates the feed immediately before calling `getUserMedia`, which collapses the delay from minutes to **0.13 s measured**, and the burned-in capture clock in the picture matches the page's wall clock to the second in a screenshot. The audio/video exclusivity is **not** solvable from this side — it is one Chromium switch governing both devices. For a call that needs sound, `tools/bridge-mic` alone gives any tab genuinely live phone audio; for one that needs the camera, the fake-device switch is required and the microphone becomes synthetic. PipeWire plus the `xdg-desktop-portal` camera portal (`--enable-webrtc-pipewire-camera`) would sidestep both halves, but `pipewire` cannot be installed without root here, so it stays **untested rather than ruled out**. |
+| 17 | **A browser could not be given a live camera *and* live audio at the same time.** Chromium's only route for an injected camera was `--use-file-for-fake-video-capture`, and that file device is only registered when `--use-fake-device-for-media-stream` is also present — verified by removing it, after which `getUserMedia({video:true})` failed outright (`videoOpened False`, `0x0`). But that same switch also replaces the **microphone** with a synthetic tone: a clip recorded through the demo came back clipping at full scale with a dead-constant RMS of 14448, nothing like the room. `FileVideoCaptureDevice` also plays the file from its first byte and never seeks, so the picture started as far behind the present as the file was long. | Medium | ✅ fixed | **Superseded by gaps #20–#24 and now closed.** The premise was wrong: a browser does not need a fake device if it is given a real one. With `native/hw-enable install`, an ordinary Chromium — no switches, no wrapper — enumerates `Phone Camera (SELinux Bridge)` and `phone_mic`, and `getUserMedia({video:true,audio:true})` returns **both live at once**. Measured: 720x1280@30, 4044 frames dequeued in one session, 18100/19200 sampled pixels non-black with frame-to-frame differences tracking live sensor noise, and the microphone reading the same signal `parec` sees. The camera can also be released and re-acquired repeatedly inside one browser process, which is what a real video call does. |
 | 18 | **A capture session was accepted before it was checked.** `handleCamera` wrote its OK status line *and then* called `CameraSource.stream()`, which is where the camera index is validated. So an invalid index — `bridge_client camera -i 9` — produced `handshake ok, capture source: camera:9`, a session that opened and immediately stopped, an empty file, and **exit 0**. The client's own accounting said `camera: 0 unit(s), 0 byte(s)` and nothing anywhere said why. The mock refused it correctly, and the selftest passed, because the mock validates *before* replying — so the test suite was asserting the right behaviour against the wrong ordering, and only real hardware could show the difference. Found in the first hour of running v6 against the phone, in a feature added one commit earlier. | Medium | ✅ fixed | Camera selection is now a separate `CameraSource.resolve()` that runs **before** the status line, so a bad index is refused with `camera index 9 out of range (this device has 4, so 0..3; 'bridge_client info' lists them)` and a nonzero exit. `MicSource.check()` does the same for an audio format the device will not accept. Belt and braces on the client too: a capture that ends without ever receiving a format record now reports `capture produced nothing` and fails, so this class of silent acceptance cannot recur even from a bridge that gets the ordering wrong. The selftest gained a stand-in bridge that accepts and then dies, which is the exact shape of the bug. |
 | 19 | **The camera came out on its side.** A phone's sensor is mounted to suit the industrial design rather than the screen, so the HAL hands over frames rotated by a fixed angle — 90° on this device's back sensors, 270° on the front. `CameraSource` passed those buffers through untouched, so every capture arrived a quarter turn over: `bridge-webcam` into `ffplay`, the ffmpeg encoders, and the browser demo all showed a sideways picture. Nothing in the protocol carried the angle either, so a downstream reader had no way to discover it and no way to ask for it. Invisible to every test in the suite, because the mock has no sensor and byte counts are identical whichever way up the image is. | Medium | ✅ fixed | `CameraSource` now reads `SENSOR_ORIENTATION` and rotates before the frame goes on the wire, so a capture is upright with nothing downstream having to know. The directive rides in **bits 8–15 of the existing codec field** — the same trick gap #14 used for rate control — so the 24-byte header is unchanged and there is no protocol bump; `0` means "use the sensor's own angle", which is what an existing v6 client sends, so it gets the fix for free. `bridge_client --rotate none\|90\|180\|270` overrides it. The rotation is a **blocked transpose** rather than the obvious nested loop, which would miss the cache on every write; it costs nothing worth reporting at 720p. A quarter turn swaps the *announced* dimensions, so the format record (gap #13) is what makes this safe — the size you ask for still picks the sensor mode, rather than the bridge quietly choosing a worse mode to hit the number you typed. `info` prints each sensor's angle. |
+| 20 | **There was no camera device at all.** Everything above reached the camera through a FIFO or a file, because the container cannot create a device node: that needs `v4l2loopback`, hence `CAP_SYS_MODULE` and a module tree, and here `CapEff` is `0000000000000000` and `/lib/modules` does not exist. So every consumer had to be told where the camera was, and anything that insists on a V4L2 node — which is most things — could not be served. | **High** | ✅ fixed | `native/v4l2-shim.c` answers *for* the device instead of creating one. An application does not talk to a driver; it talks to libc, and a V4L2 client makes about a dozen distinct libc calls. Interposing those (`open`, `close`, `read`, `ioctl`, `mmap`/`mmap64`, `munmap`, the `stat` family) is indistinguishable from a driver, from the application's side. Stock `ffmpeg` captures **60 frames in exactly 2.000000 s at 30 fps** from `/dev/video0` with no flags; VLC, Chromium and `udevadm` all work unmodified. Geometry is discovered rather than assumed, because asking for 1280x720 yields **720x1280** here. |
+| 21 | **Every Chromium- and Electron-based application aborted on launch.** Not "ran slowly" or "fell back to software" — the GPU process died with `exit_code=256` before any window appeared, so Chromium, VS Code and every Electron app were unusable. `--use-angle=swiftshader` failed identically, which ruled out the GL backend. The cause was `libpci` calling `pcilib: Cannot open /proc/bus/pci/devices`, a path this container cannot read at all (`ls` reports `-?????????? ?`). | **High** | ✅ fixed | `native/pci-shim.c` answers that one path. A/B control: **3 crashes** with the shim moved aside, **0** with it in place; with it, `/proc/<gpu-pid>/maps` contains `libvulkan_freedreno.so` and 16 `/opt/mesa-adreno` mappings and **zero** swrast/llvmpipe/SwiftShader entries — so the browser is not merely starting, it is on the Adreno. |
+| 22 | **Device enumeration returned nothing, so browsers reported no camera *and* no microphone.** With `/dev/video0` working and PulseAudio serving audio, Chromium still listed **0 video and 0 audio** devices. `libudev` opens a `NETLINK_KOBJECT_UEVENT` socket during initialisation; that socket is denied here, `udev_monitor_new_from_netlink()` fails, and libudev then reports an empty device list rather than an error. One denied socket therefore zeroed out both device classes — and the microphone had nothing to do with netlink, which is what made this so misleading to chase. | **High** | ✅ fixed | `native/netlink-shim.c` hands out a working substitute socket so libudev initialises. Chromium then reports `1v/2a` and both `getUserMedia({audio:true})` and `{video:true}` succeed. |
+| 23 | **The camera was openable but not discoverable.** `ffmpeg -i /dev/video0` worked while browsers and GStreamer still showed nothing, because they never scan `/dev`: they walk `/sys/class/video4linux`, read `name` and `dev` out of each entry, and only then open the node they were told about. Here `/sys` is traversable but not listable — the directories carry `x` without `r` — so `opendir("/sys/class/video4linux")` fails with `EACCES` while `open()` of a known path underneath succeeds. | **High** | ✅ fixed | `native/sysfs-shim.c` overlays a synthetic entry, generated at install time so it can name this device and reproduce the symlink layout a real driver produces (the class entry links into `/sys/devices`, the device links back to its subsystem; udev follows both and rejects an entry where they disagree). The overlay is **additive** — a path is redirected only where the synthetic tree has something at it — because a blanket `/sys` redirect breaks the C library itself, which reads `/sys/devices/system/cpu/online`. Verified: `ls /sys/class/video4linux` goes from `Permission denied` to `video0`, `udevadm info` goes from `Unknown device: No such device` to a full resolution (`N: video0`, `D: c 81:0`, `U: video4linux`), and `/sys/devices/system/cpu/online` still reads `0-7` through the shim. |
+| 24 | **`libv4l2` applications bypassed the shim entirely.** VLC opened `/dev/video0`, and then failed at the first `VIDIOC_QUERYCAP` with `EACCES` — the kernel's answer to an `ioctl` on the pipe backing our handle. Tracing showed the `open()` reaching the shim and **not a single `ioctl` following it**. `libv4l2` — the userspace conversion layer VLC, cheese and most GTK camera apps go through — deliberately does not call libc: its private header defines `SYS_IOCTL` and friends as direct `syscall()` invocations, because `libv4l2` also ships `v4l2convert.so`, which interposes those very symbols, so calling them would make it recurse into itself. Nothing in the shim was wrong; it simply was not being asked. | Medium | ✅ fixed | `syscall()` is itself an ordinary libc function, so the shim interposes **it** as well and routes `SYS_ioctl`/`SYS_read`/`SYS_close`/`SYS_mmap`/`SYS_munmap`/`SYS_openat` on our handles back through the same implementations. The passthrough uses inline `svc` rather than `dlsym(RTLD_NEXT, "syscall")`, because `syscall()` can be called before the constructor has run and must not depend on the dynamic linker having got there first. VLC went from a 160-byte empty file to a **10.4 MB H.264 capture, 720x1280, 3069 frames**. |
 
 ## Verification of the fixes
 
@@ -1005,6 +1113,21 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #19 rotate | Cost of the blocked transpose at 1280x720, **real device** | **24.8 fps rotated against 25.0 fps raw**, byte counts identical — the turn is free at capture rates |
 | #19 rotate | `--rotate none` against the same sensor, **real device** | exactly what the sensor saw, i.e. the override reaches the hardware path rather than being applied twice or ignored |
 | #19 rotate | A **v6 client that predates the fix** (sends a bare codec field) | rotates by the sensor angle automatically — `0` means "ask the sensor", so the header is wire-identical and old clients are fixed without being rebuilt |
+| #20 device | Stock `ffmpeg -f v4l2 -i /dev/video0`, no flags, no wrapper | **60 frames in exactly 2.000000 s at 30 fps**, 720x1280, repeated after every change to the shim |
+| #20 device | Two handles open at once (`tools/twoopen`-style probe) | second `open()` succeeds and answers `QUERYCAP`/`ENUM_FMT`; `REQBUFS` on it returns **EBUSY**; the first handle still delivers **30/30** frames — the kernel's own policy, which is many opens and exclusive *streaming* |
+| #20 device | Acquire / release / re-acquire, 3 cycles, with a blocked `DQBUF` racing each teardown | **PASS**, blocked `DQBUF` returns within 0 ms of `STREAMOFF` every cycle |
+| #21 pci | Chromium launched 3x with the shim moved aside, then 3x with it in place | **3 GPU-process crashes → 0**; with the shim, the GPU process maps `libvulkan_freedreno.so` and **no** software rasteriser |
+| #22 udev | Chromium `enumerateDevices()` before / after the netlink shim | **0v/0a → 1v/2a** |
+| #23 sysfs | `ls /sys/class/video4linux` before / after | `Permission denied` → `video0` |
+| #23 sysfs | `udevadm info --path=/class/video4linux/video0` before / after | `Unknown device: No such device` → `N: video0`, `D: c 81:0`, `U: video4linux`, `E: DEVNAME=/dev/video0` |
+| #23 sysfs | `/sys/devices/system/cpu/online` read through the overlay | `0-7`, unchanged — the overlay is additive, so glibc's own sysfs reads still work |
+| #24 libv4l2 | VLC `v4l2:///dev/video0` → H.264 mp4, before the `syscall()` interposer | **160-byte empty file**; trace shows `open()` arriving and zero `ioctl`s |
+| #24 libv4l2 | Same command after it | **10.4 MB, H.264, 720x1280, 3069 frames**; and 1429 frames from a plain login shell with no `LD_PRELOAD` typed at all |
+| #17 browser | `getUserMedia({video:true, audio:true})` in an unmodified Chromium | **both live at once**: `Phone Camera (SELinux Bridge)` + `Default`, 720x1280@30, 18100/19200 sampled pixels non-black, frame-to-frame diffs tracking live sensor noise |
+| #17 browser | Camera requested, released and requested again inside one browser process | `VIDEO#0=OK`, `VIDEO#1=OK`, `BOTH#0=OK` — what a real video call does |
+| #17 browser | Microphone cross-check: browser analyser vs `parec` on the same source | agree — `parec` reads rms **41**, peak **233**, 99.0% non-zero over 7.94 s; the browser's lower numbers are the same signal scaled into the 0–255 byte domain |
+| native | `hw-enable doctor` after `hw-enable install` | **all native hardware paths are working** — bridge reachable, 10 frames captured, libudev resolves the camera, real sysfs intact, 524,792 B of live audio in 3 s, Adreno GPU, Chromium renders, `h264_selinuxbridge` present |
+| native | A **fresh login shell**, nothing typed | all four shims on `LD_PRELOAD`; `ffmpeg` captures 60 frames, `ls /sys/class/video4linux` lists `video0`, `udevadm` resolves it, default PulseAudio source is `phone_mic` |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm

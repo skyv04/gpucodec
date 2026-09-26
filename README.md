@@ -8,7 +8,7 @@ Two components, both answers to the same question:
 
 | | What it is |
 |---|---|
-| **`selinux-bridge/`** | An Android app that holds the SELinux-gated hardware — `MediaCodec`, `Camera2`, `AudioRecord` — and lends it to the container over a loopback socket. Plus `ffmpeg` codecs, a webcam FIFO and a PulseAudio source on the Linux side. |
+| **`selinux-bridge/`** | An Android app that holds the SELinux-gated hardware — `MediaCodec`, `Camera2`, `AudioRecord` — and lends it to the container over a loopback socket. Plus, on the Linux side, `ffmpeg` codecs and a set of small `LD_PRELOAD` shims that put the phone's camera on **`/dev/video0`** and its microphone on the default PulseAudio source — so ordinary applications (ffmpeg, VLC, Chromium) use the hardware with no flags, no wrappers and no knowledge of this project. |
 | **AGC-1** (`agc.c`, `ffmpeg/`) | A video codec written from scratch to run entirely in GPU compute shaders, for when you want no app in the loop at all. |
 
 ## AGC-1

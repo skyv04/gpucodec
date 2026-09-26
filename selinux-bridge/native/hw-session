@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+#
+# hw-session -- keep the phone's microphone published as the default
+# PulseAudio source for as long as the desktop session lasts.
+#
+# bridge-mic does the hard part (see its header for why a null sink fed by
+# pacat is the only arrangement that keeps time). What it does not do is
+# survive: the phone link can drop, the app can be backgrounded and killed,
+# and the two halves of the pipeline can die independently, leaving a source
+# that exists but never produces a sample -- which looks exactly like a
+# broken microphone rather than a stopped one.
+#
+# So this supervises it. It polls bridge-mic's own `status`, which already
+# knows that a half-dead pipeline is dead, and restarts the whole thing when
+# it is. Restart attempts back off so that a phone that is simply switched
+# off does not spin the loop or re-light the microphone indicator forever.
+#
+# Usage: hw-session [start|stop|status|run]
+#
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLS="$HERE/../tools"
+STATE_DIR="${BRIDGE_STATE_DIR:-$HOME/.cache/selinux-bridge}"
+SUP_PID="$STATE_DIR/hw-session.pid"
+LOG="$STATE_DIR/hw-session.log"
+
+POLL_SECONDS="${HW_SESSION_POLL:-15}"
+BACKOFF_MAX="${HW_SESSION_BACKOFF_MAX:-300}"
+
+mkdir -p "$STATE_DIR"
+
+log() { printf '[%s] %s\n' "$(date +%T)" "$*" >> "$LOG"; }
+
+alive() {
+    [ -f "$SUP_PID" ] || return 1
+    local p
+    p="$(cat "$SUP_PID" 2>/dev/null)"
+    [ -n "$p" ] && [ -d "/proc/$p" ]
+}
+
+# A bridge_client left over from an earlier session -- or from before the
+# repository was renamed, which is how this was actually found -- still holds
+# the microphone. It answers to no pidfile we have, so match on the command
+# line and leave anything the current bridge-mic owns alone.
+reap_strays() {
+    local mine="" p cmd
+    [ -f "$STATE_DIR/mic.pid" ] && mine="$(tr '\n' ' ' < "$STATE_DIR/mic.pid")"
+    for d in /proc/[0-9]*; do
+        p="${d#/proc/}"
+        case " $mine " in *" $p "*) continue ;; esac
+        cmd="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" || continue
+        case "$cmd" in
+            *bridge_client*\ mic\ *)
+                log "reaping stray mic client pid $p ($cmd)"
+                kill "$p" 2>/dev/null
+                ;;
+        esac
+    done
+}
+
+supervise() {
+    local backoff=5
+    reap_strays
+    while :; do
+        if "$TOOLS/bridge-mic" status >/dev/null 2>&1; then
+            backoff=5
+        else
+            log "microphone bridge is down; restarting"
+            "$TOOLS/bridge-mic" stop  >/dev/null 2>&1
+            if "$TOOLS/bridge-mic" start >>"$LOG" 2>&1; then
+                log "microphone bridge back up"
+                backoff=5
+            else
+                log "restart failed; next try in ${backoff}s"
+                sleep "$backoff"
+                backoff=$(( backoff * 2 ))
+                [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff="$BACKOFF_MAX"
+                continue
+            fi
+        fi
+        sleep "$POLL_SECONDS"
+    done
+}
+
+case "${1:-status}" in
+start)
+    if alive; then
+        echo "already running (pid $(cat "$SUP_PID"))"
+        exit 0
+    fi
+    if ! pactl info >/dev/null 2>&1; then
+        echo "no reachable PulseAudio server" >&2
+        exit 1
+    fi
+    log "session supervisor starting"
+    supervise >>"$LOG" 2>&1 &
+    echo $! > "$SUP_PID"
+    # Give the first start a moment so `start` reports something meaningful.
+    for _ in $(seq 1 20); do
+        "$TOOLS/bridge-mic" status >/dev/null 2>&1 && break
+        sleep 1
+    done
+    if "$TOOLS/bridge-mic" status >/dev/null 2>&1; then
+        # bridge-mic sets the default source as its last step, so reading it
+        # the instant `status` turns true reports the previous default and
+        # makes a working microphone look like it was ignored.
+        for _ in $(seq 1 10); do
+            d="$(pactl info 2>/dev/null | sed -n 's/^Default Source: //p')"
+            case "$d" in phone_mic|bridge_mic*) break ;; esac
+            sleep 1
+        done
+        echo "microphone bridge running; default source: ${d:-unknown}"
+    else
+        echo "supervisor started; microphone not up yet (see $LOG)" >&2
+    fi
+    ;;
+stop)
+    if alive; then
+        kill "$(cat "$SUP_PID")" 2>/dev/null
+        sleep 0.3
+        alive && kill -9 "$(cat "$SUP_PID")" 2>/dev/null
+    fi
+    rm -f "$SUP_PID"
+    "$TOOLS/bridge-mic" stop >/dev/null 2>&1
+    echo "microphone bridge stopped"
+    ;;
+status)
+    if alive; then
+        echo "supervisor running (pid $(cat "$SUP_PID"))"
+    else
+        echo "supervisor not running"
+    fi
+    "$TOOLS/bridge-mic" status 2>&1
+    d="$(pactl info 2>/dev/null | sed -n 's/^Default Source: //p')"
+    echo "default source: ${d:-unknown}"
+    ;;
+run)
+    supervise
+    ;;
+*)
+    echo "usage: hw-session [start|stop|status|run]" >&2
+    exit 2
+    ;;
+esac

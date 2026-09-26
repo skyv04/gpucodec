@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# run-tests -- the fast regression suite for the camera shim.
+#
+# These exist because the bugs that mattered were only reproducible through
+# a browser, and a Chromium run costs two to four minutes on this machine
+# and can be killed by memory pressure half way through. Each of these
+# reproduces one of those failures in seconds, against the same shim, so a
+# change can be rejected before anyone opens a browser.
+#
+# They need the phone app running: they capture real frames, because every
+# bug worth catching here was in the interaction between a real application
+# and a real camera, not in anything a stub would exercise.
+#
+# Usage: native/run-tests [ffmpeg|twoopen|reacq|vlc|udev]...   (default: all)
+#
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHIM="$HERE/libv4l2bridge.so"
+NL_SHIM="$HERE/libnlbridge.so"
+SYSFS_SHIM="$HERE/libsysfsbridge.so"
+SYSFS_ROOT="${BRIDGE_SYSFS_ROOT:-${BRIDGE_STATE_DIR:-$HOME/.cache/selinux-bridge}/sysfs}"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+pass=0; fail=0
+ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$*"; pass=$((pass+1)); }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=$((fail+1)); }
+
+( cd "$HERE" && make --no-print-directory >/dev/null ) || { echo "build failed" >&2; exit 1; }
+
+# A stock ffmpeg reading /dev/video0 with no flags is the whole point of the
+# shim, so it is checked first and after every other test's side effects.
+t_ffmpeg() {
+    echo "stock ffmpeg on /dev/video0"
+    LD_PRELOAD="$SHIM" timeout 120 ffmpeg -hide_banner -loglevel error \
+        -f v4l2 -i /dev/video0 -t 2 -y "$TMP/cap.mp4" </dev/null >/dev/null 2>&1
+    local g
+    g="$(ffprobe -v error -show_entries stream=width,height,nb_frames \
+         -of csv=p=0 "$TMP/cap.mp4" 2>/dev/null)"
+    case "$g" in
+        *,*,[1-9]*) ok "captured $g (w,h,frames)" ;;
+        *)          bad "no usable capture (got '${g:-nothing}')" ;;
+    esac
+}
+
+# Regression for the bug where a second open() answered EBUSY: Chromium
+# reads capabilities while another stream is running, and a refusal makes it
+# drop the device with NotFoundError.
+t_twoopen() {
+    echo "concurrent handles (capability probe during capture)"
+    cc -O2 -o "$TMP/twoopen" "$HERE/tests/twoopen.c" || { bad "build"; return; }
+    local out
+    out="$(LD_PRELOAD="$SHIM" timeout 120 "$TMP/twoopen" 2>&1)"
+    if printf '%s' "$out" | grep -q "primary frames after probe: 30" &&
+       printf '%s' "$out" | grep -q "secondary REQBUFS -> -1"; then
+        ok "secondary handle describes but cannot claim; primary unaffected"
+    else
+        bad "concurrent handle policy wrong"
+        printf '%s\n' "$out" | sed 's/^/        /'
+    fi
+}
+
+# Regression for two separate teardown bugs: the heap corruption from freeing
+# buffers while the pump thread still wrote to them, and the allocator
+# re-entering our own munmap under Chromium's PartitionAlloc.
+t_reacq() {
+    echo "acquire / release / re-acquire, with a blocked DQBUF racing teardown"
+    cc -O2 -o "$TMP/reacq" "$HERE/tests/reacq.c" -lpthread || { bad "build"; return; }
+    local out
+    out="$(LD_PRELOAD="$SHIM" timeout 180 "$TMP/reacq" 1500000 2>&1)"
+    if printf '%s' "$out" | grep -q "^PASS"; then
+        ok "$(printf '%s' "$out" | grep '^PASS')"
+    else
+        bad "re-acquire failed or hung"
+        printf '%s\n' "$out" | tail -4 | sed 's/^/        /'
+    fi
+}
+
+# libv4l2 issues raw syscalls rather than calling libc, so this is the only
+# test that exercises the syscall() interposer.
+t_vlc() {
+    echo "VLC (goes through libv4l2, which bypasses libc)"
+    command -v vlc >/dev/null 2>&1 || { echo "  skip (no vlc)"; return; }
+    LD_PRELOAD="$SHIM" timeout 90 vlc -I dummy --no-audio v4l2:///dev/video0 \
+        --sout "#transcode{vcodec=h264,vb=800}:std{access=file,mux=mp4,dst=$TMP/vlc.mp4}" \
+        >/dev/null 2>&1
+    local n
+    n="$(ffprobe -v error -show_entries stream=nb_frames -of csv=p=0 "$TMP/vlc.mp4" 2>/dev/null)"
+    if [ -n "$n" ] && [ "$n" -gt 10 ] 2>/dev/null; then
+        ok "captured $n frames through libv4l2"
+    else
+        bad "libv4l2 path broken (got '${n:-nothing}')"
+    fi
+}
+
+# Browsers and GStreamer never scan /dev; they ask libudev, which walks
+# sysfs and needs the uevent socket to initialise at all.
+t_udev() {
+    echo "device enumeration (libudev, as browsers do it)"
+    command -v udevadm >/dev/null 2>&1 || { echo "  skip (no udevadm)"; return; }
+    local out
+    out="$(LD_PRELOAD="$NL_SHIM:$SYSFS_SHIM" BRIDGE_SYSFS_ROOT="$SYSFS_ROOT" \
+           timeout 60 udevadm info --path=/class/video4linux/video0 2>&1)"
+    if printf '%s' "$out" | grep -q "^N: video0"; then
+        ok "libudev resolves video0"
+    else
+        bad "libudev cannot see the camera (run: hw-enable install)"
+    fi
+    local a b
+    a="$(LD_PRELOAD="$SYSFS_SHIM" BRIDGE_SYSFS_ROOT="$SYSFS_ROOT" \
+         cat /sys/devices/system/cpu/online 2>/dev/null)"
+    b="$(cat /sys/devices/system/cpu/online 2>/dev/null)"
+    [ -n "$b" ] && [ "$a" = "$b" ] && ok "real sysfs unchanged through the overlay" \
+                                   || bad "sysfs overlay is shadowing real entries"
+}
+
+run() {
+    case "$1" in
+        ffmpeg)  t_ffmpeg ;;
+        twoopen) t_twoopen ;;
+        reacq)   t_reacq ;;
+        vlc)     t_vlc ;;
+        udev)    t_udev ;;
+        *) echo "unknown test: $1" >&2; exit 2 ;;
+    esac
+}
+
+if [ "$#" -gt 0 ]; then
+    for t in "$@"; do run "$t"; done
+else
+    for t in ffmpeg twoopen reacq vlc udev; do run "$t"; done
+fi
+
+echo ""
+echo "$pass passed, $fail failed"
+[ "$fail" = 0 ]

@@ -3,16 +3,20 @@
 # bridge-webcam -- serve the phone's camera into this container as a live
 # Y4M stream on a named pipe.
 #
-# Scope, stated plainly, because it was established by measurement and it
-# decides what this tool can be used for:
+# PREFER native/v4l2-shim.c INSTEAD. Run `native/hw-enable install` and the
+# camera appears at /dev/video0 for every application, browsers included,
+# with no FIFO and no special command line. This tool remains because a Y4M
+# pipe is still the simplest thing to hand to a one-off ffmpeg command, and
+# because it needs no LD_PRELOAD.
 #
-#   Native consumers (ffplay, mpv, VLC, ffmpeg, OBS): WORKS.
-#   Browsers: DOES NOT WORK. See the note at the end.
-#
-# There is no way to create /dev/video0 here. That needs v4l2loopback, hence
-# a kernel module, hence CAP_SYS_MODULE and a module tree; this container has
-# neither (CapEff is 0000000000000000, /lib/modules does not exist). So
-# anything that insists on a V4L2 node cannot be served at all.
+# The claim that used to stand here -- that a V4L2 node was impossible --
+# was wrong, and worth recording as such. It is true that creating a device
+# node needs v4l2loopback, hence CAP_SYS_MODULE and a module tree, and this
+# container has neither (CapEff is 0000000000000000, /lib/modules does not
+# exist). The mistake was concluding that the device therefore could not
+# exist: an application does not talk to a kernel module, it talks to libc.
+# Interposing the dozen calls a V4L2 client actually makes answers for the
+# device without creating one. See native/v4l2-shim.c.
 #
 # A FIFO is the right shape for everything else. Opening it for writing
 # blocks until a reader arrives, which gives on-demand capture for free: the
