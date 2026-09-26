@@ -124,6 +124,21 @@ t_udev() {
     else
         bad "libudev cannot see the camera (run: hw-enable install)"
     fi
+
+    # Resolving a path that is handed to you and scanning for devices you
+    # were not told about are different code paths, and toolkits do the
+    # second one: GStreamer's device provider and gudev both reach
+    # udev_enumerate_scan_devices, which needs the class directory to be
+    # listable rather than merely traversable.
+    out="$(LD_PRELOAD="$NL_SHIM:$SYSFS_SHIM" BRIDGE_SYSFS_ROOT="$SYSFS_ROOT" \
+           timeout 60 udevadm trigger --subsystem-match=video4linux \
+                                      --dry-run --verbose 2>&1)"
+    if printf '%s' "$out" | grep -q "/video4linux/video0$"; then
+        ok "libudev enumeration finds the camera without being told where"
+    else
+        bad "libudev can resolve the camera but cannot discover it"
+        printf '%s\n' "$out" | tail -3 | sed 's/^/        /'
+    fi
     local a b
     a="$(LD_PRELOAD="$SYSFS_SHIM" BRIDGE_SYSFS_ROOT="$SYSFS_ROOT" \
          cat /sys/devices/system/cpu/online 2>/dev/null)"

@@ -446,6 +446,22 @@ do_doctor() {
         printf '%s\n' "$udev" | tail -2 | sed 's/^/        /'
         fails=$((fails + 1))
     fi
+
+    # Being able to resolve a path someone hands you is not the same as
+    # being able to find the device in the first place, and toolkits do the
+    # latter: GStreamer's device provider and gudev scan the subsystem.
+    local scan
+    scan="$(LD_PRELOAD="$NL_SHIM:$SYSFS_SHIM" BRIDGE_SYSFS_ROOT="$SYSFS_ROOT" \
+            timeout 60 udevadm trigger --subsystem-match=video4linux \
+                                       --dry-run --verbose 2>&1)"
+    if printf '%s' "$scan" | grep -q "/video4linux/video0$"; then
+        ok "a subsystem scan discovers it (what GStreamer and gudev do)"
+    else
+        bad "the camera can be resolved but not discovered by a scan"
+        printf '%s\n' "$scan" | tail -2 | sed 's/^/        /'
+        fails=$((fails + 1))
+    fi
+
     # A blanket /sys redirect would break the C library itself, so confirm
     # the overlay is additive.
     if [ "$(LD_PRELOAD="$SYSFS_SHIM" BRIDGE_SYSFS_ROOT="$SYSFS_ROOT" \

@@ -1151,12 +1151,14 @@ rather than waited for; all of it is now checked in as `tools/selftest` and
 | #25 session | Generated `~/.config/xfce4/xinitrc`, then `hw-enable uninstall` | file **removed outright**; `.xprofile` cleaned |
 | #25 session | A pre-existing user `xinitrc` with its own settings, through install and uninstall | block inserted above the user's lines, then removed — `diff` reports the file **identical to the original** |
 | #25 session | `hw-enable status` against a desktop started before the install | warns that menu-launched apps will not see the hardware until the session restarts, and that new terminals are fine |
-| native | `native/run-tests` (ffmpeg, concurrent handles, re-acquire, duplicated handles, libv4l2, libudev) | **7 passed, 0 failed** |
+| native | `native/run-tests` (ffmpeg, concurrent handles, re-acquire, duplicated handles, libv4l2, libudev) | **8 passed, 0 failed** |
 | #26 gstreamer | `gst-launch-1.0 v4l2src ! jpegenc ! multifilesink`, 30 buffers | **30 of 30 frames written and all 30 distinct**, ~100–116 KB each, real luminance — not a frozen or black frame |
 | #26 dup | `tests/dupfd.c`: allocate on the original, `STREAMON`/`DQBUF` on the duplicate | 1,382,400-byte frame through the dup; capture survives closing either reference, in both orders |
 | #26 control | The same test against the **pre-fix** shim built from the previous commit | fails at exactly `STREAMON on the dup: Permission denied`, so the test measures the fix rather than the weather |
 | #26 regression | Whole container re-checked under the new `dup`/`fcntl` interposers: `ls`, pipes, `git`, `tar`, `sort`, shell fd redirection, Python `os.dup` | all unaffected |
 | #26 browser | Chromium re-run after the change: `getUserMedia({video:true,audio:true})`, snapshot, enumerate, release, re-acquire | `video=1 audio=1`, **720x1280 with 489,439/921,600 non-black pixels**, `video=1 audio=2` devices, re-acquire ok |
+| enumeration | `udevadm trigger --subsystem-match=video4linux --dry-run`, i.e. a **scan** rather than resolving a path handed to you — what GStreamer's device provider and gudev do | finds `/sys/devices/platform/soc/soc:qcom,cam-req-mgr/video4linux/video0`; with `BRIDGE_SYSFS_DISABLE=1` the same command fails with `Failed to scan devices: Permission denied` |
+| concurrency | Two **separate processes** capturing at the same time, each its own `ffmpeg` | both succeed — 30 frames at 720x1280 each; the bridge serves concurrent camera sessions |
 
 The server-side halves of #1, #10 and #11 live in the APK, and sideloading
 on this device needs a physical install tap that cannot be scripted (`pm
